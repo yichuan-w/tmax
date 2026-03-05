@@ -11,7 +11,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import os
 import litellm
+os.environ.setdefault("OPENAI_API_KEY", "dummy")
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -145,9 +147,13 @@ class TassieAgent(BaseAgent):
         for step in range(self.max_steps):
             logger.info(f"Step {step + 1}/{self.max_steps}")
 
-            response = await litellm.acompletion(
-                model=model, messages=messages, tools=TOOLS, temperature=0.0,
-            )
+            try:
+                response = await litellm.acompletion(
+                    model=model, messages=messages, tools=TOOLS, temperature=0.7, top_p=0.95,
+                )
+            except Exception as e:
+                logger.error(f"LiteLLM error: {type(e).__name__}: {e}")
+                raise
             msg = response.choices[0].message.model_dump()
             messages.append(msg)
 
@@ -190,8 +196,8 @@ class TassieAgent(BaseAgent):
         output = result.stdout or ""
         if result.stderr:
             output += f"\nSTDERR:\n{result.stderr}"
-        if result.exit_code != 0:
-            output = f"Exit code {result.exit_code}\n{output}"
+        if result.return_code != 0:
+            output = f"Exit code {result.return_code}\n{output}"
         return output or "(no output)"
 
     async def _str_replace_editor(self, args: dict[str, Any], env: BaseEnvironment) -> str:
@@ -219,7 +225,7 @@ class TassieAgent(BaseAgent):
             new_str = args.get("new_str", "")
             # Read, replace, write back
             result = await env.exec(command=f"cat {path}")
-            if result.exit_code != 0:
+            if result.return_code != 0:
                 return f"ERROR reading {path}: {result.stderr}"
             content = result.stdout
             if old_str not in content:
@@ -238,7 +244,7 @@ class TassieAgent(BaseAgent):
             text = args.get("new_str", "")
             # Save for undo
             result = await env.exec(command=f"cat {path}")
-            if result.exit_code != 0:
+            if result.return_code != 0:
                 return f"ERROR reading {path}: {result.stderr}"
             self._undo_stack[path] = result.stdout
             # Insert after line_num (line_num+1 for sed's 'i' which inserts before)
