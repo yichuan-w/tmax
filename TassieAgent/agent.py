@@ -1,7 +1,7 @@
-"""TassieAgent — a Harbor BaseAgent with a simple tool-use loop.
+"""TassieAgent — a Harbor BaseAgent with a simple bash-only tool loop.
 
 Implements Harbor's BaseAgent interface and drives an LLM through
-sandbox tasks using execute_bash, str_replace_editor, and submit tools.
+sandbox tasks using only bash execution. Inspired by mini-SWE-agent.
 """
 
 from __future__ import annotations
@@ -20,93 +20,53 @@ from harbor.models.agent.context import AgentContext
 
 logger = logging.getLogger(__name__)
 
+MAX_OUTPUT_CHARS = 10_000
+
+
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    n_elided = len(text) - limit
+    return f"{text[:half]}\n\n... [{n_elided} characters elided] ...\n\n{text[-half:]}"
+
+
+SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+
 SYSTEM_PROMPT = """\
-You are a helpful coding assistant. You have access to a bash terminal and a file editor. \
-Use the tools to explore the codebase, understand the problem, implement a solution, and \
-verify it works. When you are confident your solution is correct, use the submit tool.
+You are a helpful coding assistant. You have access to a bash terminal.
+Use it to explore the codebase, understand the problem, implement a solution, and verify it works.
+
+IMPORTANT RULES:
+- Every response must include a THOUGHT section explaining your reasoning, followed by exactly one bash command.
+- Directory or environment variable changes are not persistent. Every command runs in a new subshell. \
+Use `cd /path && <command>` to run commands in a specific directory.
+- Edit files using bash commands like `sed`, `cat > file << 'EOF'`, etc.
+- Long running commands: Wrap with `timeout`, e.g., `timeout 10 <command>`.
+- Interactive commands are not possible. Use `yes`/`no`, etc. as appropriate.
+- Output may be truncated. Use `head`/`tail`/`grep` to filter large outputs.
+- When you are confident your solution is correct, submit by running: \
+`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+- After submitting you cannot continue working on the task.
 """
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_bash",
-            "description": (
-                "Execute a bash command in the terminal.\n"
-                "* Long running commands: Wrap with `timeout`, e.g., `timeout 10 <command>`.\n"
-                "* Interactive: Not possible. Use `yes`/`no`, etc. as appropriate.\n"
-                "* Output: May be truncated. Use `head`/`tail`/`grep` to filter."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute.",
-                    },
+BASH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Execute a bash command. Each command runs in a new subshell.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute.",
                 },
-                "required": ["command"],
             },
+            "required": ["command"],
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "str_replace_editor",
-            "description": (
-                "Custom editing tool for viewing, creating, and editing files.\n"
-                "* State is persistent across command calls and discussions.\n"
-                "* `view` for reading files/directories, `create` for new files,\n"
-                "  `str_replace` for editing, `insert` for adding lines,\n"
-                "  `undo_edit` to revert the last edit to a file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
-                        "description": "The editor command to run.",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path to file or directory.",
-                    },
-                    "file_text": {
-                        "type": "string",
-                        "description": "Required for `create`. The full content of the new file.",
-                    },
-                    "old_str": {
-                        "type": "string",
-                        "description": "Required for `str_replace`. The exact string to replace (must appear exactly once).",
-                    },
-                    "new_str": {
-                        "type": "string",
-                        "description": "Optional for `str_replace` (omit to delete old_str), required for `insert`.",
-                    },
-                    "insert_line": {
-                        "type": "integer",
-                        "description": "Required for `insert`. Line number after which to insert `new_str`.",
-                    },
-                    "view_range": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Optional for `view`. Two-element [start, end] line range.",
-                    },
-                },
-                "required": ["command", "path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit",
-            "description": "Submit your solution and run the test suite. Only call when you believe the task is complete.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-]
+}
 
 
 class TassieAgent(BaseAgent):
@@ -123,11 +83,13 @@ class TassieAgent(BaseAgent):
         logs_dir: Path,
         model_name: str | None = None,
         max_steps: int = 30,
+        cost_limit: float = 3.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
-        self._undo_stack: dict[str, str] = {}  # path -> previous content
+        self.cost_limit = cost_limit
+        self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
         pass
@@ -147,13 +109,25 @@ class TassieAgent(BaseAgent):
         for step in range(self.max_steps):
             logger.info(f"Step {step + 1}/{self.max_steps}")
 
+            if self.cost_limit > 0 and self.cost >= self.cost_limit:
+                logger.warning(f"Cost limit reached: ${self.cost:.2f} >= ${self.cost_limit:.2f}")
+                break
+
             try:
                 response = await litellm.acompletion(
-                    model=model, messages=messages, tools=TOOLS, temperature=0.7, top_p=0.95,
+                    model=model, messages=messages, tools=[BASH_TOOL], temperature=0.7, top_p=0.95,
                 )
             except Exception as e:
                 logger.error(f"LiteLLM error: {type(e).__name__}: {e}")
                 raise
+
+            try:
+                step_cost = litellm.completion_cost(response, model=model)
+            except Exception:
+                step_cost = 0.0
+            self.cost += step_cost
+            logger.info(f"Step cost: ${step_cost:.4f}, total: ${self.cost:.4f}")
+
             msg = response.choices[0].message.model_dump()
             messages.append(msg)
 
@@ -164,14 +138,16 @@ class TassieAgent(BaseAgent):
             done = False
             for tc in tool_calls:
                 func = tc["function"]
-                name = func["name"]
                 args = json.loads(func["arguments"]) if isinstance(func["arguments"], str) else func["arguments"]
+                command = args.get("command", "")
 
-                result = await self._dispatch(name, args, environment)
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                output = await self._execute_bash(command, environment)
 
-                if name == "submit":
+                # Check for submit marker
+                if output.startswith(SUBMIT_MARKER):
                     done = True
+
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _truncate(output)})
 
             if done:
                 break
@@ -179,19 +155,7 @@ class TassieAgent(BaseAgent):
         # Save trajectory
         (self.logs_dir / "trajectory.json").write_text(json.dumps(messages, indent=2, default=str))
 
-    async def _dispatch(
-        self, name: str, args: dict[str, Any], env: BaseEnvironment
-    ) -> str:
-        if name == "execute_bash":
-            return await self._execute_bash(args, env)
-        elif name == "str_replace_editor":
-            return await self._str_replace_editor(args, env)
-        elif name == "submit":
-            return await self._submit(env)
-        return f"Unknown tool: {name}"
-
-    async def _execute_bash(self, args: dict[str, Any], env: BaseEnvironment) -> str:
-        command = args.get("command", "")
+    async def _execute_bash(self, command: str, env: BaseEnvironment) -> str:
         result = await env.exec(command=command)
         output = result.stdout or ""
         if result.stderr:
@@ -199,77 +163,3 @@ class TassieAgent(BaseAgent):
         if result.return_code != 0:
             output = f"Exit code {result.return_code}\n{output}"
         return output or "(no output)"
-
-    async def _str_replace_editor(self, args: dict[str, Any], env: BaseEnvironment) -> str:
-        cmd = args.get("command", "")
-        path = args.get("path", "")
-
-        if cmd == "view":
-            view_range = args.get("view_range")
-            if view_range and len(view_range) == 2:
-                start, end = view_range
-                result = await env.exec(command=f"sed -n '{start},{end}p' {path} | cat -n")
-            else:
-                result = await env.exec(command=f"cat -n {path}")
-            return result.stdout or f"ERROR: Could not read {path}\n{result.stderr}"
-
-        elif cmd == "create":
-            file_text = args.get("file_text", "")
-            escaped = file_text.replace("'", "'\\''")
-            await env.exec(command=f"mkdir -p $(dirname {path})")
-            await env.exec(command=f"cat > {path} << 'TASSIE_EOF'\n{escaped}\nTASSIE_EOF")
-            return f"File created at {path}."
-
-        elif cmd == "str_replace":
-            old_str = args.get("old_str", "")
-            new_str = args.get("new_str", "")
-            # Read, replace, write back
-            result = await env.exec(command=f"cat {path}")
-            if result.return_code != 0:
-                return f"ERROR reading {path}: {result.stderr}"
-            content = result.stdout
-            if old_str not in content:
-                return "ERROR: old_str not found in file."
-            if content.count(old_str) > 1:
-                return f"ERROR: old_str found {content.count(old_str)} times, must be unique."
-            # Save for undo
-            self._undo_stack[path] = content
-            new_content = content.replace(old_str, new_str, 1)
-            escaped = new_content.replace("'", "'\\''")
-            await env.exec(command=f"cat > {path} << 'TASSIE_EOF'\n{escaped}\nTASSIE_EOF")
-            return "Replacement applied."
-
-        elif cmd == "insert":
-            line_num = args.get("insert_line", 0)
-            text = args.get("new_str", "")
-            # Save for undo
-            result = await env.exec(command=f"cat {path}")
-            if result.return_code != 0:
-                return f"ERROR reading {path}: {result.stderr}"
-            self._undo_stack[path] = result.stdout
-            # Insert after line_num (line_num+1 for sed's 'i' which inserts before)
-            escaped = text.replace("'", "'\\''")
-            insert_at = line_num + 1
-            await env.exec(command=f"sed -i '{insert_at}i\\{escaped}' {path}")
-            return f"Inserted after line {line_num}."
-
-        elif cmd == "undo_edit":
-            if path not in self._undo_stack:
-                return "ERROR: No edit to undo for this file."
-            prev = self._undo_stack.pop(path)
-            escaped = prev.replace("'", "'\\''")
-            await env.exec(command=f"cat > {path} << 'TASSIE_EOF'\n{escaped}\nTASSIE_EOF")
-            return f"Undo applied for {path}."
-
-        return f"Unknown subcommand: {cmd}"
-
-    async def _submit(self, env: BaseEnvironment) -> str:
-        await env.exec(command="mkdir -p /logs/verifier")
-        result = await env.exec(command="bash /tests/test.sh", timeout_sec=120)
-        try:
-            reward_result = await env.exec(command="cat /logs/verifier/reward.txt")
-            reward = float(reward_result.stdout.strip())
-        except Exception:
-            reward = 0.0
-        output = result.stdout or "(no test output)"
-        return f"Test output:\n{output}\nReward: {reward}"
