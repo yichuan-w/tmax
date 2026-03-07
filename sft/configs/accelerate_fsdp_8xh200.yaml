@@ -17,6 +17,9 @@ downcast_bf16: "no"
 fsdp_config:
   sharding_strategy: FULL_SHARD
   auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  offload_param: false
-  offload_optimizer: false
+  backward_prefetch: BACKWARD_PRE
+  forward_prefetch: false
+  use_orig_params: true
+  offload_param: true
+  offload_optimizer: true
   state_dict_type: FULL_STATE_DICT

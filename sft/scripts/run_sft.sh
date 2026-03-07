@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # ── Config ───────────────────────────────────────────────────────────────────
 MODEL="Qwen/Qwen3.5-4B"
+BACKEND="fsdp" # "fsdp" or "deepspeed"
 ACCELERATE_CONFIG="configs/accelerate_fsdp_8xh200.yaml"
+DS_CONFIG="configs/ds_z3_sp8.json"
 NUM_GPUS=8
 
 # Data
@@ -40,7 +42,8 @@ OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
 
 # Training parameters. Match nemontron-terminal-8B
 GLOBAL_BATCH_SIZE=128
-MAX_LENGTH=65536 # 32768 * 2
+# MAX_LENGTH=65536 # 32768 * 2
+MAX_LENGTH=32768
 NUM_EPOCHS=2
 LR=2e-5
 
@@ -58,18 +61,52 @@ if [ -n "$TOKENIZED_DATASET" ]; then
     DATA_ARGS=(--tokenized_dataset_path $TOKENIZED_DATASET)
 fi
 
-accelerate launch \
-    --config_file "$ACCELERATE_CONFIG" \
-    train.py \
-    --model_name_or_path "$MODEL" \
-    --output_dir "$OUTPUT_DIR" \
-    "${DATA_ARGS[@]}" \
-    --num_gpus "$NUM_GPUS" \
-    --max_length "$MAX_LENGTH" \
-    --num_train_epochs "$NUM_EPOCHS" \
-    --learning_rate "$LR" \
-    --global_batch_size "$GLOBAL_BATCH_SIZE" \
-    --logging_steps "$LOGGING_STEPS" \
-    --save_steps "$SAVE_STEPS" \
-    --seed "$SEED" \
-    --dataset_num_proc 1
+mkdir -p "$OUTPUT_DIR"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="${OUTPUT_DIR}/train_${TIMESTAMP}.log"
+echo "Starting training. Logging output to: $LOG_FILE"
+
+# Tell Triton to cache on the scrubbed partition (which has space/inodes) instead of the home partition
+export TRITON_CACHE_DIR="/gpfs/scrubbed/osey/.triton_cache"
+
+if [ "$BACKEND" = "fsdp" ]; then
+    echo "Using FSDP backend with config: $ACCELERATE_CONFIG"
+    accelerate launch \
+        --config_file "$ACCELERATE_CONFIG" \
+        train.py \
+        --model_name_or_path "$MODEL" \
+        --output_dir "$OUTPUT_DIR" \
+        "${DATA_ARGS[@]}" \
+        --num_gpus "$NUM_GPUS" \
+        --per_device_train_batch_size 1 \
+        --max_length "$MAX_LENGTH" \
+        --num_train_epochs "$NUM_EPOCHS" \
+        --learning_rate "$LR" \
+        --global_batch_size "$GLOBAL_BATCH_SIZE" \
+        --logging_steps "$LOGGING_STEPS" \
+        --save_steps "$SAVE_STEPS" \
+        --seed "$SEED" \
+        --dataset_num_proc 1 2>&1 | tee "$LOG_FILE"
+elif [ "$BACKEND" = "deepspeed" ]; then
+    echo "Using DeepSpeed backend with config: $DS_CONFIG"
+    accelerate launch \
+        --use_deepspeed \
+        train.py \
+        --deepspeed "$DS_CONFIG" \
+        --model_name_or_path "$MODEL" \
+        --output_dir "$OUTPUT_DIR" \
+        "${DATA_ARGS[@]}" \
+        --num_gpus "$NUM_GPUS" \
+        --per_device_train_batch_size 1 \
+        --max_length "$MAX_LENGTH" \
+        --num_train_epochs "$NUM_EPOCHS" \
+        --learning_rate "$LR" \
+        --global_batch_size "$GLOBAL_BATCH_SIZE" \
+        --logging_steps "$LOGGING_STEPS" \
+        --save_steps "$SAVE_STEPS" \
+        --seed "$SEED" \
+        --dataset_num_proc 1 2>&1 | tee "$LOG_FILE"
+else
+    echo "Error: Unknown BACKEND '$BACKEND'"
+    exit 1
+fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # ── Config ───────────────────────────────────────────────────────────────────
 MODEL=Qwen/Qwen3.5-4B
@@ -11,11 +11,11 @@ BASE_PATH="/gpfs/scrubbed/osey/tmax"
 # Data
 SUBSETS="dataset_adapters skill_based_easy skill_based_medium skill_based_mixed"
 SEED=42
-SAMPLE_FRAC=0.1  # set empty to disable sub-sampling
+SAMPLE_FRAC=0.05  # set empty to disable sub-sampling
 
 # Tokenization
 MAX_LENGTH=65536 # 32768 * 2
-NUM_PROC=64 
+NUM_PROC=16 
 
 # Sharding and path construction
 DATASET_NAME="nemotron-terminal"
