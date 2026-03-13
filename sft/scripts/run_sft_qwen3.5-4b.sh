@@ -3,14 +3,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MODEL="Qwen/Qwen3.5-4B"
+MODEL="/gpfs/scrubbed/osey/tmax/models/Qwen3.5-4B"
 BACKEND="deepspeed" # "fsdp" or "deepspeed"
 
 # Accelerate config files (pick one per backend)
 FSDP_CONFIG="configs/accelerate_fsdp_8xh200.yaml"
-DS_CONFIG="configs/accelerate_ds_z3_sp8_8xh200.yaml"
+DS_CONFIG="configs/accelerate_ds_z3_sp4_8xh200.yaml"
 # Alternatives:
-#   configs/accelerate_ds_z3_sp4_8xh200.yaml   (SP=4 + DP=2, 2D parallel)
+#   configs/accelerate_ds_z3_sp8_8xh200.yaml   (SP=8 + DP=1, max sequence length)
 
 NUM_GPUS=8
 
@@ -19,7 +19,7 @@ SUBSETS="dataset_adapters skill_based_easy skill_based_medium skill_based_mixed"
 SEED=42
 # SAMPLE_FRAC=0.1  # uncomment for a quick test run
 # Optional: path to a pre-tokenized dataset created by pre_tokenize.py
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_nemotron-terminal_0.05_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260310_v2_qwen3_42"
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_PATH="/gpfs/scrubbed/osey/tmax/sft/output"
@@ -88,6 +88,8 @@ COMMON_ARGS=(
     --save_steps "$SAVE_STEPS"
     --seed "$SEED"
     --dataset_num_proc 1
+    --packing
+    --optim adamw_torch_fused
 )
 
 if [ "$BACKEND" = "fsdp" ]; then

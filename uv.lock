@@ -3456,6 +3456,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+rl-data = [
+    { name = "datasets" },
+    { name = "litellm" },
+    { name = "pydantic" },
+    { name = "tenacity" },
+    { name = "tqdm" },
+]
 sft = [
     { name = "accelerate" },
     { name = "causal-conv1d", marker = "python_full_version < '3.14'" },
@@ -3475,20 +3482,25 @@ sft = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'sft'", specifier = ">=1.12.0" },
     { name = "causal-conv1d", marker = "extra == 'sft'", url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.0/causal_conv1d-1.6.0+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" },
+    { name = "datasets", marker = "extra == 'rl-data'" },
     { name = "datasets", marker = "extra == 'sft'", specifier = ">=4.6.1" },
     { name = "deepspeed", marker = "extra == 'sft'", specifier = ">=0.18.7" },
     { name = "flash-attn", marker = "extra == 'sft'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" },
     { name = "flash-linear-attention", marker = "extra == 'sft'", specifier = ">=0.4.1" },
     { name = "harbor" },
     { name = "litellm" },
+    { name = "litellm", marker = "extra == 'rl-data'" },
     { name = "pyarrow", marker = "extra == 'sft'", specifier = ">=23.0.1" },
+    { name = "pydantic", marker = "extra == 'rl-data'" },
+    { name = "tenacity", marker = "extra == 'rl-data'" },
     { name = "tensorboard", marker = "extra == 'sft'" },
     { name = "torch", marker = "extra == 'sft'", specifier = "==2.8.0" },
+    { name = "tqdm", marker = "extra == 'rl-data'" },
     { name = "transformers", marker = "extra == 'sft'", specifier = ">=5.2.0" },
     { name = "trl", marker = "extra == 'sft'", specifier = ">=0.29.0" },
     { name = "wandb", marker = "extra == 'sft'" },
 ]
-provides-extras = ["sft"]
+provides-extras = ["sft", "rl-data"]
 
 [[package]]
 name = "tokenizers"
