@@ -43,7 +43,7 @@ NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 ACCEL_CONFIG="configs/accelerate_ds_z3_sp4_2x8xh200.yaml"
 
 # Data
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260315_qwen3_asst_loss_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260317_qwen3_asst_loss_42"
 
 # Subsampling (comment out to train on the full dataset)
 MAX_TRAIN_SAMPLES=100000
@@ -52,8 +52,8 @@ SEED=42
 # Training hyperparams
 GLOBAL_BATCH_SIZE=128
 MAX_LENGTH=65536
-NUM_EPOCHS=2
-LR=2e-5
+NUM_EPOCHS=1
+LR=2e-6
 
 LOGGING_STEPS=1
 SAVE_STEPS=0.1
@@ -77,8 +77,8 @@ if [ -n "${MAX_TRAIN_SAMPLES:-}" ]; then
     DATA_NAME="${DATA_NAME}_n${MAX_TRAIN_SAMPLES}"
 fi
 
-OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
-RUN_NAME="${MODEL_NAME}_${DATA_NAME}"
+OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}_e${NUM_EPOCHS}_lr${LR}"
+RUN_NAME="${MODEL_NAME}_${DATA_NAME}_e${NUM_EPOCHS}_lr${LR}"
 mkdir -p "$OUTPUT_DIR"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
