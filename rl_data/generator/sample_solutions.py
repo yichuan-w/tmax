@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from datetime import datetime, timezone
 from math import comb
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,6 +24,57 @@ SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 HARNESS_CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "sft" / "preprocessing" / "config"
 SYSTEM_PROMPT = (HARNESS_CONFIG_DIR / "system_prompt.txt").read_text().strip()
 TOOL_SCHEMAS = json.loads((HARNESS_CONFIG_DIR / "tool_schemas.json").read_text())
+
+# Max characters per log entry (full stdout/stderr from container); avoids huge files.
+_MAX_CMD_DEBUG_CHARS = 512_000
+
+
+class CommandDebugLogger:
+    """Append-only per-solution command/output logs for debugging (thread-safe per env index)."""
+
+    def __init__(self, base_dir: Path, num_envs: int, task_path: str) -> None:
+        self.base_dir = Path(base_dir).resolve()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._locks = [threading.Lock() for _ in range(num_envs)]
+        readme = self.base_dir / "README.txt"
+        if not readme.exists():
+            readme.write_text(
+                "Per-solution bash command logs from generate_solutions / run_n_solutions.\n"
+                f"task.json: {task_path}\n"
+                "Files: env_0000.log, env_0001.log, ... (one parallel solution attempt each).\n"
+                "Each block: timestamp, turn, success, command, raw PTY output.\n",
+                encoding="utf-8",
+            )
+
+    def log(
+        self,
+        env_idx: int,
+        turn: int,
+        command: str,
+        success: bool,
+        output: str,
+        *,
+        note: str = "",
+    ) -> None:
+        if env_idx < 0 or env_idx >= len(self._locks):
+            return
+        path = self.base_dir / f"env_{env_idx:04d}.log"
+        body = output or ""
+        if len(body) > _MAX_CMD_DEBUG_CHARS:
+            tail = len(body) - _MAX_CMD_DEBUG_CHARS
+            body = body[:_MAX_CMD_DEBUG_CHARS] + f"\n... [{tail} characters truncated for log]\n"
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        extra = f"  note={note}" if note else ""
+        block = (
+            f"\n{'=' * 80}\n"
+            f"time={ts}  solution={env_idx}  turn={turn}  success={success}{extra}\n"
+            f"$ {command}\n"
+            f"{'-' * 80}\n"
+            f"{body}\n"
+        )
+        with self._locks[env_idx]:
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(block)
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_LENGTH) -> str:
@@ -60,7 +113,7 @@ def _extract_tool_call(response_msg: dict) -> Dict[str, Optional[str]]:
     else:
         args = args_raw
 
-    command = args.get("command", "")
+    command = args.get("command", "").strip()
     tool_call_id = tc.get("id")
 
     if SUBMIT_MARKER in command:
@@ -84,6 +137,11 @@ def run_n_solutions(
     verbose: bool = True,
     num_pool_workers: int = 128,
     run_initial_tests: bool = True,
+    command_timeout: float = 120.0,
+    shell_init_timeout: float = 120.0,
+    shell_init_attempts: int = 3,
+    log_commands: bool = False,
+    command_log_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Produce n interactive solutions for the given task using tool-calling format."""
 
@@ -107,6 +165,19 @@ def run_n_solutions(
     ]
 
     envs: List[ContainerEnvironment] = []
+    cmd_logger: Optional[CommandDebugLogger] = None
+    if log_commands:
+        if command_log_dir:
+            log_root = Path(command_log_dir).expanduser().resolve()
+        elif save_dir:
+            log_root = (Path(save_dir).expanduser().resolve() / "debug_commands")
+        else:
+            log_root = None
+        if log_root is not None:
+            cmd_logger = CommandDebugLogger(log_root, num_solutions, str(Path(task_path).resolve()))
+        elif verbose:
+            print("⚠️  log_commands=True but no command_log_dir and no save_dir; command debug logs disabled.")
+
     try:
         start_time = time.time()
 
@@ -118,6 +189,9 @@ def run_n_solutions(
                 def_path=def_path,
                 max_actions=max_actions,
                 verbose=verbose,
+                read_timeout=command_timeout,
+                shell_init_timeout=shell_init_timeout,
+                shell_init_attempts=shell_init_attempts,
             )
             ok = env.initialize(run_initial_tests=False)
             if not ok:
@@ -185,6 +259,10 @@ def run_n_solutions(
                     to_mark_done.append(n)
                     if act["tool_call_id"] and act["command"]:
                         success, output = envs[n].exec(act["command"])
+                        if cmd_logger:
+                            cmd_logger.log(
+                                n, num_steps, act["command"], success, output or "", note="submit"
+                            )
                         messages[n].append({
                             "role": "tool",
                             "tool_call_id": act["tool_call_id"],
@@ -204,6 +282,8 @@ def run_n_solutions(
                 def _exec_one(item: tuple[int, str, str]) -> tuple[int, bool, str, str]:
                     idx, cmd, tc_id = item
                     success, output = envs[idx].exec(cmd)
+                    if cmd_logger:
+                        cmd_logger.log(idx, num_steps, cmd, success, output or "")
                     return idx, success, output, tc_id
 
                 with ThreadPoolExecutor(max_workers=num_pool_workers) as pool:

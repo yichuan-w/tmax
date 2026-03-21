@@ -8,6 +8,7 @@ import os
 import pty
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -33,6 +34,11 @@ class InteractiveContainerEnvironment:
         max_actions: int = 50,
         verbose: bool = True,
         read_timeout: float = 30.0,
+        #: Time to wait for the first shell prompt / init marker. Under heavy
+        #: concurrent Apptainer load (many workers × many solutions), 10s is often
+        #: too short and causes spurious "Shell init timed out".
+        shell_init_timeout: float = 120.0,
+        shell_init_attempts: int = 3,
     ):
         # Resolve all incoming paths to absolute paths
         self.sif_path = Path(container_sif_path).expanduser().resolve()
@@ -43,8 +49,12 @@ class InteractiveContainerEnvironment:
         self.max_actions = max_actions
         self.verbose = verbose
         self.read_timeout = read_timeout
+        self.shell_init_timeout = shell_init_timeout
+        self.shell_init_attempts = max(1, shell_init_attempts)
 
         self.temp_dir: Optional[Path] = None
+        #: Host copy of image /home/user, bind-mounted over /home/user in the instance
+        self._writable_home_path: Optional[Path] = None
         self.action_history: List[Dict[str, str]] = []
         self.instance_name: Optional[str] = None
 
@@ -152,11 +162,8 @@ class InteractiveContainerEnvironment:
     # ----------------------------
     # Shell lifecycle
     # ----------------------------
-    def _start_shell(self) -> bool:
-        """Start an interactive Apptainer shell session on a PTY."""
-        if self.shell_process:
-            return True
-
+    def _start_shell_once(self) -> bool:
+        """Single attempt: PTY + apptainer shell + wait for init marker."""
         # Create PTY pair
         self.master_fd, self.slave_fd = pty.openpty()
 
@@ -193,8 +200,8 @@ class InteractiveContainerEnvironment:
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
-            # Give shell a brief moment to start up
-            time.sleep(0.05)
+            # Under concurrent instance load, the shell needs longer than a few ms
+            time.sleep(0.2)
             if self.shell_process.poll() is not None:
                 if self.verbose:
                     print("Apptainer shell exited early with code:", self.shell_process.returncode)
@@ -212,10 +219,13 @@ class InteractiveContainerEnvironment:
                 f"printf '{self._marker}:0\\n'"
             )
             os.write(self.master_fd, (init_script + "\n").encode("utf-8"))
-            _, code = self._read_until_marker(timeout=10.0)
+            _, code = self._read_until_marker(timeout=self.shell_init_timeout)
             if code is None:
                 if self.verbose:
-                    print("Shell init timed out.")
+                    print(
+                        f"Shell init timed out after {self.shell_init_timeout}s "
+                        "(try lowering --workers / concurrent solutions, or raise --shell-init-timeout)."
+                    )
                 return False
 
             if self.verbose:
@@ -228,6 +238,27 @@ class InteractiveContainerEnvironment:
             if self.verbose:
                 print(f"Failed to start shell: {e}")
             return False
+
+    def _start_shell(self) -> bool:
+        """Start an interactive Apptainer shell session on a PTY (with retries)."""
+        if self.shell_process:
+            return True
+
+        for attempt in range(self.shell_init_attempts):
+            if attempt > 0:
+                self._stop_shell()
+                delay = min(4.0, 0.5 * (2 ** (attempt - 1)))
+                if self.verbose:
+                    print(
+                        f"Retrying shell start ({attempt + 1}/{self.shell_init_attempts}) "
+                        f"after {delay:.1f}s..."
+                    )
+                time.sleep(delay)
+
+            if self._start_shell_once():
+                return True
+
+        return False
 
     def _stop_shell(self):
         """Stop the interactive shell session and close PTY."""
@@ -266,6 +297,49 @@ class InteractiveContainerEnvironment:
                         pass
             self.master_fd = None
             self.slave_fd = None
+            # Drop any stale PTY output so the next shell start doesn't confuse readers
+            try:
+                while True:
+                    self.output_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+    def _recover_shell(self) -> None:
+        """Recover the shell after a command timeout by killing the running command and re-syncing.
+
+        Without this, a timed-out command keeps running in the shell. The next
+        exec() sends a new command into the still-busy shell, corrupting its
+        state. Every subsequent command then also times out, cascading into
+        total failure.
+        """
+        try:
+            # Send Ctrl+C twice to interrupt running command (handles subshells)
+            os.write(self.master_fd, b'\x03')
+            time.sleep(0.3)
+            os.write(self.master_fd, b'\x03')
+            time.sleep(0.3)
+
+            # Drain any output from the killed command
+            self._drain_queue()
+
+            # Re-sync: send a fresh marker and verify the shell responds
+            sync_cmd = f"printf '{self._marker}:0\\n'\n"
+            os.write(self.master_fd, sync_cmd.encode("utf-8"))
+            _, sync_code = self._read_until_marker(timeout=5.0)
+
+            if sync_code is None:
+                if self.verbose:
+                    print("⚠️  Shell unresponsive after Ctrl+C, restarting...")
+                self._stop_shell()
+                self._start_shell()
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️  Recovery failed ({e}), restarting shell...")
+            try:
+                self._stop_shell()
+                self._start_shell()
+            except Exception:
+                pass
 
     def _stop_instance(self) -> None:
         """Stop the Apptainer instance if running."""
@@ -275,6 +349,51 @@ class InteractiveContainerEnvironment:
                 capture_output=True
             )
             self.instance_name = None
+
+    def _materialize_writable_home_user(self) -> Tuple[bool, str]:
+        """Copy the image's ``/home/user`` tree to the host and bind-mount it on the instance.
+
+        With ``--fakeroot`` + ``--writable-tmpfs``, ``/home/user`` often lives on
+        ``fuse-overlayfs``. Creating regular files there can fail with
+        ``OSError: [Errno 22] Invalid argument`` (see agent debug logs). Binding a
+        normal host directory (e.g. on GPFS or local disk) over ``/home/user`` makes
+        task outputs and tests reliable.
+        """
+        assert self.temp_dir is not None
+        dest = self.temp_dir / "_writable_home_user"
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True, exist_ok=True)
+
+        inner_mount = "/mnt/_agent_home_materialize"
+        copy_cmd = [
+            "apptainer",
+            "exec",
+            "--fakeroot",
+            "--userns",
+            "--writable-tmpfs",
+            "--cleanenv",
+            "--bind",
+            f"{dest}:{inner_mount}",
+            str(self.sif_path),
+            "/bin/sh",
+            "-c",
+            f"cp -a /home/user/. {inner_mount}/",
+        ]
+        proc = subprocess.run(
+            copy_cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            err = (proc.stdout or "") + (proc.stderr or "")
+            return False, f"materialize /home/user failed (exit {proc.returncode}): {err.strip() or 'no output'}"
+
+        self._writable_home_path = dest
+        if self.verbose:
+            print(f"✅ Materialized writable /home/user at {dest}")
+        return True, ""
 
     # ----------------------------
     # Public API
@@ -303,6 +422,14 @@ class InteractiveContainerEnvironment:
         # Create temporary directory for test files (on host)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="agent_env_")).resolve()
 
+        ok_mat, mat_msg = self._materialize_writable_home_user()
+        if not ok_mat:
+            if self.verbose:
+                print(f"❌ {mat_msg}")
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self.temp_dir = None
+            return False
+
         # Start a long-lived Apptainer instance
         self.instance_name = f"agent_{uuid.uuid4().hex[:8]}"
         start_cmd = [
@@ -311,6 +438,7 @@ class InteractiveContainerEnvironment:
             "--userns",
             "--writable-tmpfs",
             "--bind", f"{self.temp_dir}:{self.temp_dir}",
+            "--bind", f"{self._writable_home_path}:/home/user",
             "--cleanenv",
             str(self.sif_path),
             self.instance_name,
@@ -330,6 +458,7 @@ class InteractiveContainerEnvironment:
         if not self._start_shell():
             if self.verbose:
                 print("❌ Failed to start interactive shell")
+            self._stop_shell()
             self._stop_instance()
             return False
         else:
@@ -381,6 +510,8 @@ class InteractiveContainerEnvironment:
         # Clear any stale output
         _ = self._drain_queue()
 
+        command = command.strip()
+
         # Wrap the command to always emit our marker with the exit code
         # Use a subshell to ensure we capture the correct `$?` across pipelines
         # Special-case heredocs: avoid grouping with braces so the terminator can be on its own line
@@ -400,10 +531,11 @@ class InteractiveContainerEnvironment:
 
         raw_out, code = self._read_until_marker(timeout=timeout)
         
-        # Handle timeout
+        # Handle timeout: kill the running command and recover the shell
         if code is None:
             if self.verbose:
                 print(f"⚠️  Command timed out after {timeout or self.read_timeout}s")
+            self._recover_shell()
             return False, f"Command timed out. Partial output:\n{raw_out[:500]}"
         
         # Clean output: strip ANSI, strip echoed lines (PTY has no echo, but some programs add it)
@@ -413,6 +545,36 @@ class InteractiveContainerEnvironment:
         success = (code == 0)
         return success, cleaned
 
+    def _write_file_to_container(self, content: str, container_path: str) -> Tuple[bool, str]:
+        """Write a file into the container via the bound temp directory.
+
+        Avoids sending large content through the PTY (which can overflow the
+        kernel buffer or corrupt shell state via heredocs).
+
+        Note: ``cp`` from the bind mount into ``/home/user`` can fail with EINVAL on
+        some Apptainer/overlay stacks. Prefer :meth:`_write_test_on_bind_mount` for
+        pytest files (run pytest on the bind-mounted path; no copy to ``/home/user``).
+        """
+        host_path = self.temp_dir / f"_transfer_{uuid.uuid4().hex[:8]}"
+        host_path.write_text(content, encoding="utf-8")
+        return self.exec(f"cp {host_path} {container_path}")
+
+    def _write_test_on_bind_mount(self, content: str, basename: str) -> Tuple[bool, str, Optional[Path]]:
+        """Write test content under ``temp_dir`` (bind-mounted); same path in container.
+
+        Avoids ``cp … /home/user/…`` which may return EINVAL on some setups.
+        """
+        if not self.temp_dir:
+            return False, "temp_dir not initialized", None
+        try:
+            root = self.temp_dir.resolve()
+            path = (root / basename).resolve()
+            path.relative_to(root)
+            path.write_text(content, encoding="utf-8")
+            return True, "", path
+        except (ValueError, OSError) as e:
+            return False, str(e), None
+
     def run_initial_tests(self) -> bool:
         """Run initial state validation tests."""
         if self.verbose:
@@ -421,40 +583,15 @@ class InteractiveContainerEnvironment:
         with open(self.initial_test_path, "r") as f:
             test_file_text = f.read()
 
-        test_path_in_container = "/home/user/test_initial.py"
-
-        # Write test file with retry logic
-        max_retries = 1
-        retry_delay = 0.1
-
-        for attempt in range(max_retries):
-            marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
-            write_cmd = (
-                f"cat <<'{marker}' > {test_path_in_container}\n"
-                f"{test_file_text}\n"
-                f"{marker}\n"
-            )
-
-            success, output = self.exec(write_cmd)
-            if success:
-                break
-
+        ok, err, test_path = self._write_test_on_bind_mount(test_file_text, "pytest_initial_state.py")
+        if not ok or test_path is None:
             if self.verbose:
-                print(f"⚠️  Write attempt {attempt + 1}/{max_retries} failed: {output[:100]}")
+                print(f"❌ Failed to write test file: {err}")
+            return False
 
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                if self.verbose:
-                    print(f"❌ Failed to write test file after {max_retries} attempts: {output}")
-                return False
-
-        # Run pytest on the file inside the instance
-        test_success, test_output = self.exec(f"pytest -q {test_path_in_container}")
-
-        # Clean up the test file from the instance
-        self.exec(f"rm -f {test_path_in_container}")
+        q = shlex.quote(str(test_path))
+        test_success, test_output = self.exec(f"pytest -q {q}")
+        self.exec(f"rm -f {q}")
 
         if not test_success:
             if self.verbose:
@@ -473,40 +610,15 @@ class InteractiveContainerEnvironment:
         with open(self.final_test_path, "r") as f:
             test_file_text = f.read()
 
-        test_path_in_container = "/home/user/test_final.py"
-
-        # Write test file with retry logic
-        max_retries = 1
-        retry_delay = 0.1
-
-        for attempt in range(max_retries):
-            marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
-            write_cmd = (
-                f"cat <<'{marker}' > {test_path_in_container}\n"
-                f"{test_file_text}\n"
-                f"{marker}\n"
-            )
-            ok, write_out = self.exec(write_cmd)
-
-            if ok:
-                break
-
+        ok, write_out, test_path = self._write_test_on_bind_mount(test_file_text, "pytest_final_state.py")
+        if not ok or test_path is None:
             if self.verbose:
-                print(f"⚠️  Write attempt {attempt + 1}/{max_retries} failed: {write_out[:100]}")
+                print(f"❌ Failed to write final test file: {write_out}")
+            return False, write_out
 
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                if self.verbose:
-                    print(f"❌ Failed to write final test file after {max_retries} attempts: {write_out}")
-                return False, write_out
-
-        # Run pytest inside the instance
-        test_success, test_output = self.exec(f"pytest -q {test_path_in_container}")
-
-        # Clean up test file
-        self.exec(f"rm -f {test_path_in_container}")
+        q = shlex.quote(str(test_path))
+        test_success, test_output = self.exec(f"pytest -q {q}")
+        self.exec(f"rm -f {q}")
 
         if self.verbose:
             if test_success:
@@ -520,6 +632,7 @@ class InteractiveContainerEnvironment:
     def cleanup(self):
         """Clean up temporary files and processes."""
         self._stop_shell()
+        self._writable_home_path = None
         if self.temp_dir and self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         self._stop_instance()

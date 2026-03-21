@@ -5,10 +5,12 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, TextIO
 
 from tqdm import tqdm
 
@@ -35,6 +37,42 @@ class SolutionConfig:
     max_tokens: int = 65536
     filter_solved: bool = False
     use_parquet: bool = False
+    command_timeout: float = 30.0
+    #: If False, skip task dirs that already have a `*_summary.json` (default).
+    #: Set True (--force-rerun) to regenerate solutions and overwrite summaries.
+    force_rerun: bool = False
+    shell_init_timeout: float = 120.0
+    shell_init_attempts: int = 3
+    log_commands: bool = False
+    #: Relative to each task dir if not absolute; default when log_commands: solutions/debug_commands
+    command_log_dir: Optional[str] = None
+    #: If set, copy everything printed to stdout/stderr (terminal) into this file (append).
+    terminal_log: Optional[str] = None
+
+
+class _TeeTextStream:
+    """Write to the real terminal stream and to a log file (for debugging full run output)."""
+
+    def __init__(self, primary: TextIO, log_file: TextIO) -> None:
+        self._primary = primary
+        self._log = log_file
+
+    def write(self, data: str) -> int:
+        n = self._primary.write(data)
+        self._primary.flush()
+        self._log.write(data)
+        self._log.flush()
+        return int(n) if isinstance(n, int) else len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._log.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self._primary, "isatty", lambda: False)()
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
 
 
 def build_and_test(
@@ -119,6 +157,16 @@ def process_task(task_dir: str, cfg: SolutionConfig):
         print(f"[{task_dir.name}] Running {cfg.num_solutions} solutions...")
         solutions_dir.mkdir(exist_ok=True)
 
+        cmd_log_resolved: Optional[Path] = None
+        if cfg.log_commands:
+            if cfg.command_log_dir:
+                p = Path(cfg.command_log_dir).expanduser()
+                cmd_log_resolved = p if p.is_absolute() else (task_dir / p)
+            else:
+                cmd_log_resolved = solutions_dir / "debug_commands"
+            cmd_log_resolved = cmd_log_resolved.resolve()
+            print(f"[{task_dir.name}] Command debug logs -> {cmd_log_resolved}")
+
         summary = run_n_solutions(
             num_solutions=cfg.num_solutions,
             container_sif_path=str(sif_path),
@@ -134,6 +182,11 @@ def process_task(task_dir: str, cfg: SolutionConfig):
             verbose=cfg.verbose,
             num_pool_workers=cfg.num_pool_workers,
             run_initial_tests=False,
+            command_timeout=cfg.command_timeout,
+            shell_init_timeout=cfg.shell_init_timeout,
+            shell_init_attempts=cfg.shell_init_attempts,
+            log_commands=cfg.log_commands,
+            command_log_dir=str(cmd_log_resolved) if cmd_log_resolved else None,
         )
 
         model_name = cfg.model.replace("/", "_")
@@ -169,15 +222,49 @@ def parse_args(argv: Optional[List[str]] = None) -> SolutionConfig:
     ap.add_argument("--force-build", action="store_true", help="Force build the SIF file")
     ap.add_argument("--filter-solved", action="store_true", help="Only solve tasks that have been solved already")
     ap.add_argument("--use-parquet", action="store_true", help="Use parquet file for tasks")
+    ap.add_argument("--command-timeout", type=float, default=30.0, help="Per-command timeout in seconds inside containers (default: 30)")
+    ap.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="Re-run solution generation even when a *_summary.json already exists (overwrites on success)",
+    )
+    ap.add_argument(
+        "--shell-init-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for Apptainer interactive shell init marker (raise if many concurrent containers)",
+    )
+    ap.add_argument(
+        "--shell-init-attempts",
+        type=int,
+        default=3,
+        help="Retries if shell init times out (default: 3)",
+    )
+    ap.add_argument(
+        "--log-commands",
+        action="store_true",
+        help="Write each container bash command and raw output to per-solution log files under the task (see --command-log-dir)",
+    )
+    ap.add_argument(
+        "--command-log-dir",
+        type=str,
+        default=None,
+        help="Directory for command debug logs: absolute path, or relative to each task folder (default: <task>/solutions/debug_commands)",
+    )
+    ap.add_argument(
+        "--terminal-log",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Append full stdout/stderr of this process (everything on your central terminal) to PATH; still prints to terminal",
+    )
 
     args = ap.parse_args(argv)
     return SolutionConfig(**vars(args))
 
 
-def main():
-    """Main entry point for solution generation."""
-    cfg = parse_args()
-
+def _run_generate_solutions(cfg: SolutionConfig) -> None:
+    """Core driver (stdout/stderr may be teed by main())."""
     all_entries = list(Path(cfg.tasks_dir).iterdir())
     task_dirs = [
         d
@@ -246,6 +333,19 @@ def main():
     def process_task_with_retry(task_dir: str, cfg: SolutionConfig):
         """Wrap per-task retry logic so it can run in parallel."""
         task_dir = Path(task_dir)
+
+        sol_dir = task_dir / "solutions"
+        existing = (
+            [f for f in sol_dir.glob("*_summary.json") if f.name != "summary.json"]
+            if sol_dir.exists()
+            else []
+        )
+        if existing and not cfg.force_rerun:
+            print(f"Skipping {task_dir.name} (already has {existing[0].name})")
+            return task_dir, "skipped"
+        if existing and cfg.force_rerun:
+            print(f"Re-running {task_dir.name} (--force-rerun; overwriting {existing[0].name})")
+
         max_retries = 1
         result = None
 
@@ -277,6 +377,35 @@ def main():
                         _td, _res = fut.result()
                     finally:
                         pbar.update(1)
+
+
+def main() -> None:
+    """Main entry point; optionally tee terminal output to a single log file."""
+    cfg = parse_args()
+    log_f: Optional[TextIO] = None
+    if cfg.terminal_log:
+        log_path = Path(cfg.terminal_log).expanduser().resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_f = open(log_path, "a", encoding="utf-8", errors="replace")
+        log_f.write(f"\n{'=' * 80}\n")
+        log_f.write(f"terminal log opened {datetime.now(timezone.utc).isoformat()}\n")
+        log_f.write(f"cwd={os.getcwd()}\n")
+        log_f.write(f"argv={' '.join(sys.argv)}\n")
+        log_f.flush()
+        sys.stdout = _TeeTextStream(sys.__stdout__, log_f)
+        sys.stderr = _TeeTextStream(sys.__stderr__, log_f)
+        print(f"📝 Also logging terminal output to: {log_path}", flush=True)
+
+    try:
+        _run_generate_solutions(cfg)
+    finally:
+        if log_f is not None:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            try:
+                log_f.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

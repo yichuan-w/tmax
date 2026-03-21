@@ -11,11 +11,11 @@ set -euo pipefail
 
 # ---- Parameters (edit here) ----
 NUM_TASKS=10
-OUT_DIR="rl_data/output/tasks_skill_tax_20260319"
+OUT_DIR="rl_data/output/tasks_skill_tax_20260320"
 MODEL="gemini/gemini-3.1-pro-preview"
 MAX_TOKENS=32768
-BATCH_SIZE=10
-MAX_CONCURRENCY=10
+BATCH_SIZE=5
+MAX_CONCURRENCY=5
 TASK_TEMPERATURE=1.0
 TEST_TEMPERATURE=0.6
 # --------------------------------
@@ -25,6 +25,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 cd "$PROJECT_ROOT"
 mkdir -p logs
+
+export APPTAINER_CACHEDIR="/gpfs/projects/h2lab/osey/apptainer_cache"
+export APPTAINER_TMPDIR="/gpfs/projects/h2lab/osey/apptainer_tmp"
 
 uv run python -c "
 from pathlib import Path

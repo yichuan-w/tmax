@@ -1,6 +1,14 @@
 """Generate tasks via batched LLM calls.
 
 Pipeline: task templates -> initial tests -> final tests -> container defs -> save.
+
+**Limits of LLM-only ground truth:** ``truth`` and ``test_final_state.py`` are generated text.
+This module does not execute setup or recompute goldens, so errors in derived quantities or
+inconsistencies between setup and stated expectations can slip through. A second model writes
+final tests from *truth*, so mis-copying or drift is possible. **Hardening:** add an external
+validation pass (execute setup, reference solution, or automated checks) before publishing;
+prompts in ``task_template_gen`` / ``completion_test_gen`` encode general principles for
+consistent, reproducible *truth* and tests.
 """
 from __future__ import annotations
 
@@ -171,10 +179,12 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
     init_tests = [init_tests[i] for i in valid_indices]
     final_tests = [final_tests[i] for i in valid_indices]
 
-    # 4) Apptainer def -- single shot per item, then build/test locally
+    # 4) Apptainer def -- uses pre-built domain base images
+    domains = [m["domain"] for m in meta]
     print(f"Generating {len(descriptions)} defs with {cfg.max_concurrency} concurrency")
     def_candidates = iterate_def_template_batch(
         list(zip(descriptions, truths, init_tests)),
+        domains=domains,
         model=cfg.model,
         temperature=cfg.test_temperature,
         max_tokens=cfg.max_tokens,

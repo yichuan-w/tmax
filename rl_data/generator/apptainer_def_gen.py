@@ -1,9 +1,7 @@
-"""Create an Apptainer .def *template* and iterate until tests pass – with masking."""
+"""Generate lightweight per-task Apptainer defs on top of pre-built domain base images."""
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -16,162 +14,168 @@ from tqdm import tqdm
 
 from rl_data import chat_completion_batch, DEFAULT_MODEL
 
-SYSTEM_MSG = """ You are an expert in Apptainer/Singularity.
-You are given a task description and will be tested so that the initial state of the container is set up in a way that an agent can be tested on the task.
-Make sure that the container is set up in a way that an agent can be tested on the task.
-Basically ensure that the task is valid when the container is built: Clone a repository, create a file, create a directory, create a process, etc.
-Install pytest in the container.
-Don't include the tests in the response (no %test)
-The agent will not have root access. So make sure that the right permissions are set for the files and directories.
-Always use this base image by putting these two lines at the top of the def file:
-Bootstrap: docker
-From: ubuntu:22.04"""
+# ---------------------------------------------------------------------------
+# Base image registry: domain -> .sif path
+# ---------------------------------------------------------------------------
 
-BASE_USER_TEMPLATE = """
-Using the task description template and pytest failures below, output a complete
-Apptainer `.def` file.
+CONTAINERS_DIR = Path(__file__).resolve().parent.parent / "containers"
 
-Question description given to the agent:
+BASE_IMAGES: dict[str, Path] = {
+    "security":              CONTAINERS_DIR / "base_security.sif",
+    "software_engineering":  CONTAINERS_DIR / "base_software_engineering.sif",
+    "file_operations":       CONTAINERS_DIR / "base_file_operations.sif",
+    "data_querying":         CONTAINERS_DIR / "base_data_querying.sif",
+    "data_science":          CONTAINERS_DIR / "base_data_science.sif",
+    "debugging":             CONTAINERS_DIR / "base_debugging.sif",
+    "scientific_computing":  CONTAINERS_DIR / "base_scientific_computing.sif",
+    "data_processing":       CONTAINERS_DIR / "base_data_processing.sif",
+    "system_administration": CONTAINERS_DIR / "base_system_administration.sif",
+}
+
+DEFAULT_BASE = CONTAINERS_DIR / "base_software_engineering.sif"
+
+
+def _resolve_base(domain: str) -> Path:
+    base = BASE_IMAGES.get(domain, DEFAULT_BASE)
+    if not base.exists():
+        base = DEFAULT_BASE
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+SYSTEM_MSG = """\
+You are an expert in Apptainer/Singularity container setup.
+
+You will be given a task description, ground truth, and initial-state tests.
+Your job is to write an Apptainer .def file that sets up the initial state
+of the container so that an agent can be tested on the task.
+
+IMPORTANT RULES:
+- Always start the def file with exactly:
+  Bootstrap: docker
+  From: ubuntu:22.04
+- In the %post section:
+  1. Start with: export DEBIAN_FRONTEND=noninteractive
+  2. Run: apt-get update && apt-get install -y python3 python3-pip
+  3. Run: pip3 install pytest
+  4. Install ONLY the additional system or Python packages the task needs.
+     Keep package installs minimal. Prefer pip over apt when possible.
+  5. Create files, directories, and data needed for the task.
+  6. Create the user: useradd -m -s /bin/bash user || true
+  7. End with: chmod -R 777 /home/user
+- Do NOT include %test sections.
+- Do NOT create output files that the agent should produce.
+- The home path is /home/user.
+- Do NOT override HOME in %environment.
+- Do NOT use Apptainer build variables (no {{ }}).
+- Do NOT use exotic package names. If you need awk, install gawk.
+  The command 'tr' is part of coreutils, not a separate package."""
+
+BASE_USER_TEMPLATE = """\
+Write an Apptainer .def file for this task.
+
+The task domain is: {domain}
+
+Task description given to the agent:
 {task_description}
 
-Here is some ground truth data that might be useful to you:
+Ground truth (for setting up initial state):
 {truth}
 
-Here are the tests that will be run on the container:
+Tests that will verify the initial container state:
 {test_py}
 
 Previous failures (may be empty):
 {failures}
 
-Respond with the Apptainer `.def` file only. You should think step by step and then write the file. The file should be valid and buildable.
-Make sure that you create the right files and directories for the task.
-Eg: for a csv task you will have to create a csv file. For a process cleanup task you will have to create processes.
-Don't include the tests in the response or copy a test file.
-Don't add any of the output files or directories that the student will create.
-Don't create / touch empty files for the agent.
-Remember to install pytest in the container.
-The home path is /home/user.
-Don't override HOME in the %environment section; let Apptainer bind the host $HOME.
-"""
+Respond with ONLY the Apptainer .def file. It must start with:
+Bootstrap: docker
+From: ubuntu:22.04
+
+Keep the %post section focused: install only what's needed, create the
+required files/directories/data, and ensure /home/user is writable."""
 
 
 def build_and_test(def_template: str, test_py: str) -> tuple[bool, str]:
-    """Build an Apptainer image from a definition *template* and run the
-    supplied pytest code inside the container.
-
-    Parameters
-    ----------
-    def_template:
-        The text contents of the Apptainer ``.def`` file to build.
-    test_py:
-        The pytest test module (as a string) that should be executed inside
-        the freshly-built container to validate its initial state.
-    """
-    # Create an isolated workspace for the build and test run.
-    with tempfile.TemporaryDirectory() as td:
+    """Build an Apptainer image from a def and run initial-state tests."""
+    import os
+    tmp_base = os.environ.get("APPTAINER_TMPDIR", None)
+    with tempfile.TemporaryDirectory(dir=tmp_base) as td:
         td_path = Path(td)
 
-        # ------------------------------------------------------------------
-        # 1. Persist the definition template and the test module to disk
-        # ------------------------------------------------------------------
         def_path = td_path / "container.def"
         def_path.write_text(def_template)
 
         test_file = td_path / "test_initial_state.py"
         test_file.write_text(test_py)
 
-        # ------------------------------------------------------------------
-        # 2. Build the container image from the .def file
-        # ------------------------------------------------------------------
         sif_path = td_path / "img.sif"
         build_proc = subprocess.run(
             ["apptainer", "build", str(sif_path), str(def_path)],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=300,
         )
         if build_proc.returncode:
             err_snippet = (build_proc.stderr or build_proc.stdout or "")[-500:]
             print(f"Apptainer build failed (rc={build_proc.returncode}): {err_snippet}")
             return False, f"Apptainer build failed: {err_snippet}"
 
-        # copy the test file to the container at /home/agent/test_initial_state.py
-        # shutil.copy(test_file, td_path / "home" / "agent" / "test_initial_state.py")
-
-        # ------------------------------------------------------------------
-        # 3. Execute the provided pytest module inside the container
-        # ------------------------------------------------------------------
         proc = subprocess.run(
             [
-                "apptainer",
-                "exec",
-                "--fakeroot",
-                "--userns",
-                "--writable-tmpfs",
-                "--cleanenv",
+                "apptainer", "exec",
+                "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
                 str(sif_path),
-                "pytest",
-                "-q",
-                str(test_file.name),
+                "pytest", "-q", str(test_file.name),
             ],
-            cwd=td,  # Ensure the test module is visible inside the container
-            capture_output=True,
-            text=True,
+            cwd=td,
+            capture_output=True, text=True,
         )
 
-        # Remove the SIF image first, then clean up the temporary directory.
         if sif_path.exists():
             sif_path.unlink()
-
-        # Now remove the temporary directory; ignore errors in case it's
-        # already gone or cleaned up by the TemporaryDirectory context
         shutil.rmtree(td_path, ignore_errors=True)
-        # ------------------------------------------------------------------
-        # 4. Return success flag and combined stdout/stderr for inspection
-        # ------------------------------------------------------------------
+
         return proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def parse_def_template(def_template: str) -> str:
-    """
-    Clean up the raw response from the language model and return a valid
-    Apptainer definition template string.
-
-    The model is expected to reply with only the content of a .def file, yet
-    it may still wrap the output in markdown code fences (e.g. ```def or
-    ```singularity) or include explanatory text. This helper extracts the first
-    fenced code block if present; otherwise it assumes the entire response is
-    the definition. Finally, common leading indentation is removed so the
-    template can be written directly to disk.
-    """
-    # Normalise line endings and trim outer whitespace
+    """Extract and clean a .def file from LLM output."""
     cleaned = def_template.replace("\r\n", "\n").strip()
 
-    # Attempt to extract the first fenced code block
     fence_re = re.compile(r"```(?:[a-zA-Z0-9_-]+)?\n(?P<code>[\s\S]*?)```", re.MULTILINE)
     match = fence_re.search(cleaned)
     if match:
         cleaned = match.group("code").strip()
 
-    # Remove any common leading indentation
     cleaned = textwrap.dedent(cleaned).strip()
     return cleaned
+
 
 def iterate_def_template_batch(
     items: List[Tuple[str, str, str]],
     *,
+    domains: Optional[List[str]] = None,
     model: str = DEFAULT_MODEL,
     temperature: float = 0.6,
     max_tokens: int = 2048,
     max_concurrency: int = 64,
 ) -> List[Optional[str]]:
-    """Batched single-shot def generation followed by parallel build/test.
+    """Batched def generation with pre-built base images.
 
-    items: list of (task_description, truth, test_py)
-    Returns list aligned with input: the first passing def text per item, or None if fails.
+    Parameters
+    ----------
+    items : list of (task_description, truth, test_py)
+    domains : list of domain strings aligned with items (selects the base image)
     """
+    if domains is None:
+        domains = ["software_engineering"] * len(items)
 
     messages: list[list[dict[str, str]]] = []
-    for task_description, truth, test_py in items:
+    for (task_description, truth, test_py), domain in zip(items, domains):
         prompt = BASE_USER_TEMPLATE.format(
+            domain=domain.replace("_", " "),
             task_description=task_description,
             truth=truth,
             test_py=test_py,
@@ -191,7 +195,6 @@ def iterate_def_template_batch(
         max_concurrency=max_concurrency,
     )
 
-    # Prepare results aligned with input order
     results: List[Optional[str]] = [None] * len(items)
 
     def worker(index: int, item: Tuple[str, str, str], resp_obj) -> Tuple[int, Optional[str]]:
@@ -206,9 +209,9 @@ def iterate_def_template_batch(
         except Exception:
             return index, None
 
-    # Submit parallel build/test tasks
+    build_workers = min(4, len(items))
     futures = []
-    with ThreadPoolExecutor(max_workers=64) as executor:
+    with ThreadPoolExecutor(max_workers=build_workers) as executor:
         for idx, (item, resp) in enumerate(zip(items, responses)):
             futures.append(executor.submit(worker, idx, item, resp))
 
@@ -219,22 +222,13 @@ def iterate_def_template_batch(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Helper utilities
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-
-    # ------------------------------------------------------
-    # Load task template and sample concrete parameters
-    # ------------------------------------------------------
     ap = argparse.ArgumentParser()
     ap.add_argument("--task-path", type=str, default="tasks/sample_task")
     args = ap.parse_args()
     task_path = Path(args.task_path)
     def_path = task_path / "container.def"
     initial_test_path = task_path / "test_initial_state.py"
-    final_test_path = task_path / "test_final_state.py"
 
     test_py = initial_test_path.read_text()
     def_text = def_path.read_text()
@@ -242,4 +236,3 @@ if __name__ == "__main__":
     success, output = build_and_test(def_text, test_py)
     print(success)
     print(output)
-    

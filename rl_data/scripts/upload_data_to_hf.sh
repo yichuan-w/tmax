@@ -16,8 +16,8 @@ cd "$(dirname "$0")/../.."
 #   - huggingface-cli login  (or HF_TOKEN env var)
 #   - Python with datasets + huggingface_hub
 
-REPO_ID="osieosie/tmax-rl-tasks"
-INPUT_DIR="rl_data/output/tasks_toy_et"
+REPO_ID="osieosie/tmax-tasks-skill-taxonomy-20260319"
+INPUT_DIR="rl_data/output/tasks_skill_tax_20260319"
 PRIVATE="true"
 INCLUDE_SOLUTIONS="true"
 

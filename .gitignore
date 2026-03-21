@@ -11,6 +11,9 @@ __pycache__/
 *.py[cod]
 
 
+### Apptainer images (large binaries, rebuild from .def files)
+*.sif
+
 ### runs
 sft/output/
 sft/data/

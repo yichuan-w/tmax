@@ -707,6 +707,20 @@ Respond in XML format using these tags:
         starts should be mentioned here.
         Any files that should be created by the agent and their contents should
         be mentioned here.
+
+        Ground-truth principles (for accurate automated verification):
+        * **Consistency:** Anything in *truth* that could be computed from the setup
+          code, random seeds, or the task rules must actually follow from them. Do not
+          assert derived numbers, digests, or file bodies unless they are implied by
+          what you specified—avoid plausible-looking literals produced without that chain.
+        * **Reproducibility:** Prefer stating *how* to obtain a golden value (procedure,
+          formula, or a short **runnable** snippet that prints the canonical result) over
+          pasting opaque constants that nothing in the pipeline verifies.
+        * **Causal ordering:** When setup involves multiple steps (random draws, mutations,
+          I/O), make the sequence explicit. Headline summaries (e.g. simple counts) must
+          reflect the real order of operations, not an informal intuition.
+        * **Single source of truth:** Setup scripts, narrative expectations, and any
+          “expected output” blocks must agree; resolve contradictions before finishing.
 </truth>
 
 Critical Rules:
