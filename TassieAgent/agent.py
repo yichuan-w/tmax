@@ -140,6 +140,7 @@ class TassieAgent(BaseAgent):
         max_steps: int = 30,
         cost_limit: float = 0.0,
         persistent_bash: bool = False,
+        api_base: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -147,6 +148,7 @@ class TassieAgent(BaseAgent):
         self.cost_limit = cost_limit
         self.cost: float = 0.0
         self.persistent_bash = persistent_bash
+        self.api_base = api_base
 
     async def setup(self, environment: BaseEnvironment) -> None:
         if self.persistent_bash:
@@ -237,6 +239,7 @@ class TassieAgent(BaseAgent):
                 temperature = 1.0 if "gpt-5" in model else 0.7
                 return await litellm.acompletion(
                     model=model, messages=messages, tools=[bash_tool], temperature=temperature,
+                    api_base=self.api_base,
                 )
             except ABORT_EXCEPTIONS as e:
                 logger.error(f"Aborting: {type(e).__name__}: {e}")
