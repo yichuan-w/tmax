@@ -56,6 +56,13 @@ class SolutionConfig:
     #: Directory containing pre-built base SIFs (base_{domain}.sif). When set, per-task SIFs
     #: are not needed; the env uses a shared base + task-specific delta script.
     base_sifs_dir: Optional[str] = None
+    #: Random-sample at most this many tasks from ``tasks_dir`` (0 = disabled;
+    #: use ``num_tasks``/``start_at`` for sequential sampling instead).
+    #: Applied **after** ``filter_solved`` and ``use_parquet`` so the random
+    #: subsample is drawn from the already-filtered set.
+    sample_size: int = 0
+    #: Seed for the random sample; keep fixed across runs for reproducibility.
+    sample_seed: int = 0
 
 
 class _TeeTextStream:
@@ -84,10 +91,21 @@ class _TeeTextStream:
 
 
 def _patch_def_chmod(def_path: Path) -> None:
-    """Ensure ``chmod 755 /home/user`` is present in the %post section."""
+    """Ensure ``/home/user`` exists with 755 perms by the end of %post.
+
+    tmax-wide convention is that every container exposes a writable
+    ``/home/user``. Most base SIFs / task defs create it themselves, but we
+    defensively inject a ``mkdir -p /home/user && chmod 755 /home/user``
+    idiom at the top of %post so adapters that skip the convention (e.g.
+    upstream Dockerfiles that only create ``/workspace``) still build. The
+    previous form (``chmod 755 /home/user`` alone) would fail on such
+    containers because ``chmod`` errors when the path doesn't exist yet.
+    """
+    patch_line = "mkdir -p /home/user && chmod 755 /home/user"
     with open(def_path, "r") as f:
         def_text = f.read()
-    if "chmod 755 /home/user" in def_text:
+    # Already-patched (new or legacy form) -> nothing to do.
+    if patch_line in def_text or "chmod 755 /home/user" in def_text:
         return
     section_headers = [line for line in def_text.split("\n") if line.strip().startswith("%")]
     post_idx = [i for i, line in enumerate(section_headers) if "post" in line.lower()]
@@ -96,10 +114,10 @@ def _patch_def_chmod(def_path: Path) -> None:
         if idx + 1 < len(section_headers):
             next_header = section_headers[idx + 1]
             def_text = def_text.replace(
-                next_header, "    chmod 755 /home/user\n" + next_header
+                next_header, f"    {patch_line}\n" + next_header
             )
         else:
-            def_text = def_text.rstrip() + "\n    chmod 755 /home/user\n"
+            def_text = def_text.rstrip() + f"\n    {patch_line}\n"
         with open(def_path, "w") as f:
             f.write(def_text)
 
@@ -115,15 +133,28 @@ def build_sif(
     """Build a SIF from a .def with retries and exponential backoff.
 
     Returns (success, error_message_or_empty).
+
+    On ``subprocess.TimeoutExpired`` we bail **without retrying**: a per-attempt
+    wall-clock timeout usually means the def is installing something huge
+    (e.g. ``build-essential``, ~400 MB) over a slow link, and retrying will
+    burn another full timeout for the same outcome. The caller gets a clean
+    ``(False, ...)`` so the overall pre-build phase continues with other tasks.
     """
     _patch_def_chmod(def_path)
     for attempt in range(1, retries + 1):
-        proc = subprocess.run(
-            ["apptainer", "build", "--force", str(sif_path), str(def_path)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                ["apptainer", "build", "--force", str(sif_path), str(def_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            msg = (f"apptainer build exceeded {timeout}s on attempt {attempt}/"
+                   f"{retries}; skipping task to avoid blocking other builds.")
+            if verbose:
+                print(f"⏱️  [{sif_path.parent.name}] {msg}")
+            return False, msg
         if proc.returncode == 0:
             return True, ""
         err = (proc.stdout or "") + (proc.stderr or "")
@@ -326,6 +357,19 @@ def parse_args(argv: Optional[List[str]] = None) -> SolutionConfig:
         help="Directory with pre-built base_{domain}.sif files. When set, per-task SIF builds "
              "are skipped; the env uses a shared base SIF + task-specific delta script.",
     )
+    ap.add_argument(
+        "--sample-size",
+        type=int,
+        default=0,
+        help="Random-sample at most N tasks from --tasks-dir (0 = disabled). "
+             "Great for cost-bounded comparison runs against large baselines.",
+    )
+    ap.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="Seed for --sample-size so reruns pick the same tasks (default: 0).",
+    )
 
     args = ap.parse_args(argv)
     return SolutionConfig(**vars(args))
@@ -382,10 +426,15 @@ def _prepull_base_images(def_paths: list[Path]) -> None:
 def _run_generate_solutions(cfg: SolutionConfig) -> None:
     """Core driver (stdout/stderr may be teed by main())."""
     all_entries = list(Path(cfg.tasks_dir).iterdir())
+    # Accept either the canonical `task_*` prefix (skill-tax / endless-terminals)
+    # or any directory that ships a `task.json` (adapter-produced dirs like
+    # `otrl_task_1008`, `otb_*`, etc.). Mirrors the more permissive predicate
+    # used by rl_data.comparison.taxonomy_classifier.
     task_dirs = [
         d
         for d in tqdm(all_entries, desc="Scanning task directories", total=len(all_entries))
-        if d.name.startswith("task_")
+        if d.is_dir()
+        and (d.name.startswith("task_") or (d / "task.json").exists())
     ]
 
     if cfg.filter_solved:
@@ -440,6 +489,17 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
         task_dirs = [d["extra_info"]["task_dir"] for d in dataset]
 
     task_dirs = list(sorted(task_dirs))
+
+    # Optional random subsample for cost-bounded runs.  Runs BEFORE the
+    # start_at/num_tasks window so the sample is drawn once, then the usual
+    # slice still applies if someone wants to chunk the sampled set.
+    if cfg.sample_size and cfg.sample_size > 0 and cfg.sample_size < len(task_dirs):
+        import random as _random
+        rng = _random.Random(cfg.sample_seed)
+        task_dirs = rng.sample(task_dirs, cfg.sample_size)
+        task_dirs = list(sorted(task_dirs))  # deterministic ordering post-sample
+        print(f"Random sample (seed={cfg.sample_seed}): {cfg.sample_size} tasks")
+
     task_dirs = task_dirs[cfg.start_at : min(cfg.start_at + cfg.num_tasks, len(task_dirs))]
 
     if not task_dirs:
@@ -488,12 +548,15 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
 
             def _build_one(pair: tuple[Path, Path]) -> tuple[str, bool, str]:
                 sif, defp = pair
-                ok, msg = build_sif(
-                    sif, defp,
-                    retries=cfg.build_retries,
-                    verbose=True,
-                )
                 tag = sif.parent.name
+                try:
+                    ok, msg = build_sif(
+                        sif, defp,
+                        retries=cfg.build_retries,
+                        verbose=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- never crash the pre-build phase
+                    ok, msg = False, f"unexpected exception: {exc!r}"
                 if ok:
                     print(f"  ✅ {tag}")
                 else:
@@ -510,8 +573,15 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
                     futs = {bld_exec.submit(_build_one, p): p for p in to_build}
                     with tqdm(total=len(to_build), desc="Building SIFs") as bld_pbar:
                         for fut in as_completed(futs):
-                            fut.result()
-                            bld_pbar.update(1)
+                            try:
+                                fut.result()
+                            except Exception as exc:  # noqa: BLE001
+                                # Defensive: _build_one already catches everything,
+                                # but if a future is somehow cancelled or raises we
+                                # still want to drain the rest of the batch.
+                                print(f"  ❌ (future error): {exc!r}")
+                            finally:
+                                bld_pbar.update(1)
 
             built = sum(1 for td in task_dirs if (Path(td) / "container.sif").exists())
             print(f"🔨 Pre-build done: {built}/{len(task_dirs)} tasks have a SIF\n")

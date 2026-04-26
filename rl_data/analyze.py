@@ -34,11 +34,18 @@ def _shorten_cmd_complexity(raw: str) -> str:
     return _CMD_COMPLEXITY_MAP.get(prefix, prefix)
 
 
+def _is_task_dir(p: Path) -> bool:
+    """Predicate that recognizes both native `task_*` dirs and adapter-
+    produced dirs (``otrl_task_*``, ``otb_*``, ...). Mirrors the one used by
+    ``rl_data.generate_solutions`` and ``rl_data.comparison.taxonomy_classifier``."""
+    return p.is_dir() and (p.name.startswith("task_") or (p / "task.json").exists())
+
+
 def discover_models(tasks_dir: Path) -> List[str]:
     """Return sorted list of model slugs found across all task solution dirs."""
     slugs: set[str] = set()
     for task_path in tasks_dir.iterdir():
-        if not task_path.name.startswith("task_"):
+        if not _is_task_dir(task_path):
             continue
         solutions_dir = task_path / "solutions"
         if not solutions_dir.exists():
@@ -189,7 +196,7 @@ def load_tasks(
     """
     records = []
     for task_path in sorted(tasks_dir.iterdir()):
-        if not task_path.name.startswith("task_"):
+        if not _is_task_dir(task_path):
             continue
         task_json = task_path / "task.json"
         if not task_json.exists():
@@ -198,19 +205,30 @@ def load_tasks(
         with open(task_json) as f:
             task_data = json.load(f)
 
-        raw_tc = task_data.get(
-            "task_complexity", task_data.get("complexity", "unknown")
-        )
-        raw_cc = task_data.get("command_complexity", "unknown")
+        # Adapter-produced tasks (ET, OT-Agent-v1-RL, ...) leave the native
+        # taxonomy fields as "unknown" and get LLM-classified values written
+        # under `classified_*` by rl_data.comparison.taxonomy_classifier.
+        # Prefer those when present, falling back to native fields so
+        # skill-tax (which has native taxonomy) keeps working.
+        def _pref(*keys: str, default: str = "unknown") -> str:
+            for k in keys:
+                v = task_data.get(k)
+                if v not in (None, "", "unknown"):
+                    return v
+            return default
+
+        raw_tc = _pref("classified_task_complexity", "task_complexity", "complexity")
+        raw_cc = _pref("classified_command_complexity", "command_complexity")
 
         record: Dict[str, Any] = {
             "name": task_data.get("name", task_path.name),
-            "domain": task_data.get("domain", task_data.get("category", "unknown")),
-            "skill_type": task_data.get("skill_type", "unknown"),
-            "primitive_skills": task_data.get("primitive_skills", []),
+            "domain": _pref("classified_domain", "domain", "category"),
+            "skill_type": _pref("classified_skill_type", "skill_type"),
+            "primitive_skills": (task_data.get("classified_primitive_skills")
+                                 or task_data.get("primitive_skills", [])),
             "task_complexity": _shorten_task_complexity(raw_tc),
             "command_complexity": _shorten_cmd_complexity(raw_cc),
-            "scenario": task_data.get("scenario", "unknown"),
+            "scenario": _pref("classified_scenario", "scenario"),
             "dir": str(task_path),
         }
 
