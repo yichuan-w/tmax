@@ -6,6 +6,7 @@ primitive skill composition, two-axis complexity, and domain-tied personas.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 import random
 import re
@@ -638,15 +639,39 @@ _FIXTURE_NEW: list[str] = [f for f in FIXTURE_KINDS if f != _FIXTURE_LEGACY]
 
 CORPUS_KINDS: tuple[str, ...] = ("legacy", "sft_v2", "rl_v2")
 
-# Bucket-upweight multipliers per v2 corpus. M is the relative weight of the
-# new-axis bucket vs the legacy bucket. Concretely:
+# Per-axis bucket-upweight multipliers per v2 corpus. M is the relative weight
+# of the new-axis bucket vs the legacy bucket on that axis. Concretely, when M
+# is finite:
 #   P(any new) = M / (1 + M),  P(legacy) = 1 / (1 + M).
-# Tuned to compensate for the legacy 1k/10k corpora having 0 % new-axis
-# representation, so the combined corpus has more balanced new-vs-legacy
-# axis coverage. See plan §1 for the resulting per-axis distributions.
-_CORPUS_MULTIPLIER: dict[str, float] = {
-    "sft_v2": 2.0,
-    "rl_v2": 1.5,
+# Use ``math.inf`` to *always* sample from the new bucket on that axis (i.e.
+# the legacy default is never produced for that axis under that corpus_kind).
+#
+# These are tuned to compensate for the legacy 1k/10k corpora having 0 %
+# new-axis representation, so the *combined* corpus is as balanced as
+# achievable given the per-axis cardinality:
+#   * ``task_complexity`` has 4 buckets (3 legacy + 1 intricate). With a 10k
+#     legacy corpus + 5k v2 at M=3.0, intricate hits 75 % of the v2 subset and
+#     the combined 15k splits exactly 25/25/25/25 across the 4 buckets.
+#   * ``verifier_kind`` (5 buckets) and ``fixture_kind`` (7 buckets) cannot be
+#     fully balanced by 5k v2 against a 10k pure-legacy backbone, so we set
+#     M=inf to maximize coverage of the new buckets (each new value gets the
+#     largest possible share given the budget).
+_CORPUS_MULTIPLIER: dict[str, dict[str, float]] = {
+    # sft_v2 keeps the historical single-scalar behaviour (M=2.0 on every
+    # axis) so previously-generated SFT corpora remain reproducible.
+    "sft_v2": {
+        "task_complexity": 2.0,
+        "verifier_kind": 2.0,
+        "fixture_kind": 2.0,
+    },
+    # rl_v2 decouples the multipliers per axis to balance the combined
+    # 10k legacy + 5k v2 = 15k corpus on the axes where it's mathematically
+    # achievable, and maximize new-bucket coverage on the others.
+    "rl_v2": {
+        "task_complexity": 3.0,
+        "verifier_kind": math.inf,
+        "fixture_kind": math.inf,
+    },
 }
 
 
@@ -661,9 +686,14 @@ def _bucket_upweight_choice(
 
     With weights ``[M/K, M/K, ..., M/K, 1]`` (K new + 1 legacy) the totals are
     ``M + 1``, giving ``P(any new) = M/(M+1)`` and ``P(legacy) = 1/(M+1)``.
+
+    Pass ``multiplier=math.inf`` to *always* sample (uniformly) from the new
+    bucket; the legacy value is never returned in that mode.
     """
     if not new_values:
         return legacy_value
+    if math.isinf(multiplier):
+        return random.choice(new_values)
     weights = [multiplier / len(new_values)] * len(new_values) + [1.0]
     return random.choices(new_values + [legacy_value], weights=weights, k=1)[0]
 
@@ -675,8 +705,12 @@ def _bucket_upweight_complexity(multiplier: float) -> str:
     With weights ``[1/3, 1/3, 1/3, M]`` (3 legacy + 1 new) the totals are
     ``1 + M``, giving ``P(intricate) = M/(M+1)`` and ``P(any legacy) = 1/(M+1)``,
     each legacy value uniformly within the legacy bucket.
+
+    Pass ``multiplier=math.inf`` to always return ``intricate``.
     """
     if not _LEGACY_COMPLEXITIES:
+        return _INTRICATE_COMPLEXITY
+    if math.isinf(multiplier):
         return _INTRICATE_COMPLEXITY
     weights = [1.0 / len(_LEGACY_COMPLEXITIES)] * len(_LEGACY_COMPLEXITIES) + [multiplier]
     return random.choices(
@@ -1147,14 +1181,23 @@ def random_user_msg(corpus_kind: str = "legacy") -> tuple[str, str, dict]:
         no verifier_kind / fixture_kind sampling, only the original 3
         ``TASK_COMPLEXITY`` values.
 
-        ``"sft_v2"`` and ``"rl_v2"`` enable the v2 axes:
-          * ``verifier_kind`` and ``fixture_kind`` are sampled with the
-            bucket-upweight formula (``M=2`` for sft_v2, ``M=1.5`` for rl_v2),
-            making the new-axis bucket combined ``M`` × more likely than the
-            legacy default. New values are uniform within the new bucket.
-          * ``task_complexity`` is sampled with the same upweight, where the
-            "new bucket" is the single ``intricate`` value and the legacy
-            bucket is the original 3 (``short`` / ``moderate`` / ``complex``).
+        ``"sft_v2"`` and ``"rl_v2"`` enable the v2 axes, each with its own
+        per-axis bucket-upweight multipliers (see ``_CORPUS_MULTIPLIER``):
+          * ``sft_v2`` — uniform M=2.0 on every axis (preserves the original
+            single-scalar behaviour: ~67 % intricate, ~67 % non-legacy
+            verifier_kind, ~67 % non-legacy fixture_kind).
+          * ``rl_v2`` — decoupled per-axis multipliers tuned so that the
+            5k v2 corpus, when concatenated with a 10k pure-legacy corpus,
+            yields a balanced 15k mix where mathematically achievable:
+              - ``task_complexity``: M=3.0 → 75 % intricate in v2 →
+                25/25/25/25 across the 4 buckets in 15k.
+              - ``verifier_kind``: M=inf → always sample (uniformly) from
+                the 4 non-legacy verifier kinds; ``exact_text`` is never
+                emitted by v2. Combined 15k still has 67 % ``exact_text``
+                from the legacy 10k, but each new verifier reaches its
+                maximum achievable share (~8.3 %).
+              - ``fixture_kind``: M=inf → analogous to ``verifier_kind``
+                across the 6 non-legacy fixture kinds.
     """
     if corpus_kind not in CORPUS_KINDS:
         raise ValueError(
@@ -1177,10 +1220,14 @@ def random_user_msg(corpus_kind: str = "legacy") -> tuple[str, str, dict]:
         verifier_kind = _VERIFIER_LEGACY
         fixture_kind = _FIXTURE_LEGACY
     else:
-        m = _CORPUS_MULTIPLIER[corpus_kind]
-        task_complexity = _bucket_upweight_complexity(m)
-        verifier_kind = _bucket_upweight_choice(_VERIFIER_NEW, _VERIFIER_LEGACY, m)
-        fixture_kind = _bucket_upweight_choice(_FIXTURE_NEW, _FIXTURE_LEGACY, m)
+        multipliers = _CORPUS_MULTIPLIER[corpus_kind]
+        task_complexity = _bucket_upweight_complexity(multipliers["task_complexity"])
+        verifier_kind = _bucket_upweight_choice(
+            _VERIFIER_NEW, _VERIFIER_LEGACY, multipliers["verifier_kind"],
+        )
+        fixture_kind = _bucket_upweight_choice(
+            _FIXTURE_NEW, _FIXTURE_LEGACY, multipliers["fixture_kind"],
+        )
 
     command_complexity = random.choice(COMMAND_COMPLEXITY)
     scenario = random.choice(DOMAIN_SCENARIOS[domain])

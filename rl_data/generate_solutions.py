@@ -22,6 +22,21 @@ from rl_data.generator.sample_solutions import run_n_solutions
 from rl_data.generator.vanillux_solver import run_n_solutions_vanillux
 
 
+def _summary_basename(model: str, harness: str) -> str:
+    """Return the per-task solutions-summary filename for a (model, harness) pair.
+
+    Bash runs preserve the legacy ``<MODEL_TAG>_summary.json`` name byte-for-byte
+    so existing summaries in skill_tax 1k / 10k corpora keep matching. Non-bash
+    runs (currently just ``vanillux``) get a harness suffix so a single task
+    directory can carry summaries from BOTH harnesses side-by-side without one
+    overwriting the other (essential for harness A/B comparisons).
+    """
+    model_tag = model.replace("/", "_")
+    if harness == "bash":
+        return f"{model_tag}_summary.json"
+    return f"{model_tag}_{harness}_summary.json"
+
+
 @dataclass
 class SolutionConfig:
     """Configuration for running solutions on tasks."""
@@ -284,9 +299,9 @@ def process_task(task_dir: str, cfg: SolutionConfig):
             base_sifs_dir=cfg.base_sifs_dir,
         )
 
-        model_name = cfg.model.replace("/", "_")
+        summary_name = _summary_basename(cfg.model, cfg.harness)
         _safe_write_text(
-            task_dir / "solutions" / f"{model_name}_summary.json",
+            task_dir / "solutions" / summary_name,
             json.dumps(summary, indent=4),
         )
         pass_at_k = summary.get("pass_at_k", {})
@@ -476,8 +491,7 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
         def _pass16_gt_zero(task_dir: str) -> bool:
             task_dir = Path(task_dir)
             try:
-                model_name = cfg.model.replace("/", "_")
-                model_summary_path = task_dir / "solutions" / f"{model_name}_summary.json"
+                model_summary_path = task_dir / "solutions" / _summary_basename(cfg.model, cfg.harness)
                 if model_summary_path.exists():
                     return False
                 # Check any existing summary
@@ -622,7 +636,7 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
     # ------------------------------------------------------------------
     # Solution phase (high concurrency)
     # ------------------------------------------------------------------
-    model_summary_name = f"{cfg.model.replace('/', '_')}_summary.json"
+    model_summary_name = _summary_basename(cfg.model, cfg.harness)
 
     def process_task_with_retry(task_dir: str, cfg: SolutionConfig):
         """Wrap per-task retry logic so it can run in parallel."""

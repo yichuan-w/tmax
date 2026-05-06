@@ -45,13 +45,25 @@ From: ubuntu:22.04
 
     # Core scientific Python stack — picks CPU-only torch via the dedicated
     # PyPI index URL to avoid pulling the ~2 GB CUDA wheels.
+    #
+    # Includes a small set of common build / packaging / domain-specific
+    # helpers that v2 task deltas frequently invoke:
+    #   * pyinstaller         — compile Python → standalone binary
+    #     (caught by smoke: tasks asking the agent to package a CLI tool)
+    #   * cython              — C extension building from Python sources
+    #   * pybind11 / cffi     — C/C++ FFI for fixture-shipped binaries
+    #   * sympy               — symbolic math for metric_threshold verifiers
+    #   * networkx            — graph algorithms (debugging / scientific tasks)
+    #   * cryptography        — crypto / security tasks beyond pure stdlib
     pip3 install --no-cache-dir \
         pytest \
         flask requests pyyaml toml \
         numpy scipy scikit-learn pandas \
         Pillow imageio matplotlib \
         biopython \
-        beautifulsoup4 lxml
+        beautifulsoup4 lxml \
+        pyinstaller cython pybind11 cffi \
+        sympy networkx cryptography
 
     pip3 install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu \

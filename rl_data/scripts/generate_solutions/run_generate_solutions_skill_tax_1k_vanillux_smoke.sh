@@ -1,4 +1,7 @@
 #!/bin/bash
+# SBATCH directives left in place so this script can also run via sbatch on
+# clusters where that's preferred. On an interactive node, just `bash` it
+# directly — the SBATCH lines are bash comments and are ignored.
 #SBATCH --job-name=rl-vlx-smoke-50
 #SBATCH --output=logs/vlx_smoke_50_%j.out
 #SBATCH --error=logs/vlx_smoke_50_%j.err
@@ -9,35 +12,44 @@
 #SBATCH --mem=960G
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  Smoke test: VanilluxAgent harness on 50 samples of the existing 1k corpus.║
+# ║  Harness A/B smoke — bash vs vanillux on a 25-task sample                  ║
 # ║                                                                            ║
 # ║  Purpose: shake out the new --harness vanillux code path (str_replace_     ║
 # ║  editor / submit / ATIF dump) end-to-end on a small, well-known set of    ║
 # ║  tasks BEFORE we commit to a multi-day v2 RL solution-sampling run.       ║
 # ║                                                                            ║
-# ║  Approach: re-uses the existing skill_tax 1k corpus (no fresh task gen),  ║
-# ║  random-samples 50 tasks (--sample-size 50 --sample-seed 0), and runs    ║
-# ║  k=8 solutions per task with the vanillux harness.                        ║
+# ║  Approach: re-uses an EXISTING task corpus (no fresh task gen), random-    ║
+# ║  samples 25 tasks (--sample-size 25 --sample-seed 0), runs k=4 solutions  ║
+# ║  per task (was k=8 — halved to keep iteration fast). The default          ║
+# ║  TASKS_DIR points at the new v2 SFT 2k corpus — which exercises both     ║
+# ║  axes:                                                                     ║
+# ║    1. v2 fixture / verifier / intricate-complexity routing at solve time   ║
+# ║       (since v2 tasks have base_image=intricate set in task.json).         ║
+# ║    2. The harness change itself.                                           ║
 # ║                                                                            ║
-# ║  How to compare against the legacy bash harness:                          ║
-# ║    1. First run THIS script with HARNESS=bash and a different OUT_TAG     ║
-# ║       (export HARNESS=bash OUT_TAG=bash) to produce baseline summaries.   ║
-# ║    2. Then run with HARNESS=vanillux OUT_TAG=vanillux for the new path.   ║
-# ║    3. Both runs will write per-task                                       ║
-# ║         <task>/solutions/<MODEL_TAG>_summary.json                         ║
-# ║       — note the same model tag, so RUN1 and RUN2 race for the same       ║
-# ║       filename. To keep both, set FORCE_RERUN=1 on the second run AND    ║
-# ║       set OUT_TAG to a different value so the analyzer picks them apart. ║
-# ║    4. Or simpler: copy the 50 surviving summaries off-corpus before the  ║
-# ║       second run.                                                         ║
+# ║  vLLM context: VLLM_MAX_LEN=131072 (128K) by default. The pre-v2 default   ║
+# ║  of 40960 was too tight — 64-turn intricate trajectories blew past 30K    ║
+# ║  input tokens by mid-run and tripped 400-Bad-Request from vLLM. Override  ║
+# ║  via VLLM_MAX_LEN if you need to dial it down for a tighter memory job.   ║
 # ║                                                                            ║
-# ║  Recommended sequence for clean A/B:                                      ║
-# ║    HARNESS=bash     bash run_generate_solutions_skill_tax_1k_vanillux_smoke.sh
-# ║    cp -r rl_data/output/tasks_skill_tax_20260324_1k/<task>/solutions \    ║
-# ║          /tmp/bash_baseline/<task>/                                       ║
-# ║    HARNESS=vanillux FORCE_RERUN=1 bash ... vanillux_smoke.sh              ║
+# ║  How summaries are kept apart:                                             ║
+# ║    rl_data.generate_solutions writes summaries to                         ║
+# ║      <task>/solutions/<MODEL_TAG>[_<HARNESS>]_summary.json                 ║
+# ║    The harness suffix is OMITTED for HARNESS=bash (so legacy summaries    ║
+# ║    in skill_tax 1k / 10k stay valid) and INCLUDED for HARNESS=vanillux.   ║
+# ║    A bash run + a vanillux run on the same task therefore produce         ║
+# ║    side-by-side files, no overwriting, no cp-r dance needed.              ║
 # ║                                                                            ║
-# ║  Same teacher model and SBATCH topology as the legacy SFT script          ║
+# ║  Recommended sequence (interactive bash on an h200 node):                  ║
+# ║    HARNESS=bash     bash rl_data/scripts/generate_solutions/run_..._smoke.sh
+# ║    HARNESS=vanillux bash rl_data/scripts/generate_solutions/run_..._smoke.sh
+# ║                                                                            ║
+# ║  No --force-rerun needed between the two passes: the harness-suffixed     ║
+# ║  filenames don't collide. Tasks that already have the *current run's*     ║
+# ║  summary file are skipped, so re-invoking the same HARNESS is a cheap     ║
+# ║  no-op.                                                                    ║
+# ║                                                                            ║
+# ║  Same teacher model topology as the legacy SFT script                     ║
 # ║  (run_generate_solutions_skill_tax_1k.sh) — Qwen3.6-27B local vLLM,       ║
 # ║  TP=2 DP=4 on 8×H200. This way the smoke matches the deployment harness  ║
 # ║  on apples-to-apples teacher-side, isolating the harness change.          ║
@@ -46,39 +58,72 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="${TASKS_DIR:-rl_data/output/tasks_skill_tax_20260505_1k_legacy}"
+# v2 SFT 2k by default; override to the legacy 1k or 10k corpus to A/B
+# against unchanged-axes tasks.
+TASKS_DIR="${TASKS_DIR:-rl_data/output/tasks_skill_tax_v2_20260505_2k}"
 HARNESS="${HARNESS:-vanillux}"          # 'bash' or 'vanillux'
-OUT_TAG="${OUT_TAG:-vanillux_smoke}"    # for log file naming only
-SAMPLE_SIZE="${SAMPLE_SIZE:-50}"
+OUT_TAG="${OUT_TAG:-${HARNESS}_smoke}"  # for log file naming only
+SAMPLE_SIZE="${SAMPLE_SIZE:-25}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
 export LAUNCH_VLLM="${LAUNCH_VLLM:-1}"
 export VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen3.6-27B}"
 MODEL="${MODEL:-hosted_vllm/${VLLM_MODEL}}"
 
-NUM_SOLUTIONS="${NUM_SOLUTIONS:-8}"
-# vanillux's intricate prompts can use more turns; bash legacy stays at 16.
-if [ "$HARNESS" = "vanillux" ]; then
-    MAX_ACTIONS="${MAX_ACTIONS:-60}"
-else
-    MAX_ACTIONS="${MAX_ACTIONS:-16}"
-fi
-MAX_TOKENS="${MAX_TOKENS:-65536}"
+# 4-attempt pass@k for the smoke (was 8). Halves the LLM cost per task while
+# still giving a meaningful pass@1 / pass@4 signal for the harness A/B.
+NUM_SOLUTIONS="${NUM_SOLUTIONS:-4}"
+
+# Apples-to-apples step budget across both harnesses for the smoke A/B.
+# v2 tasks (intricate-complexity) routinely need >16 turns, and we want a
+# single number that exercises both harnesses fairly. 64 is generous enough
+# for vanillux's str_replace_editor + submit loop, while still bounding bash
+# runs to a similar wall-clock ceiling.
+MAX_ACTIONS="${MAX_ACTIONS:-64}"
+
+# Pre-v2 default (40960) was too tight: 64-turn intricate runs commonly
+# blow past 30K input tokens by the late turns, hitting the model-context
+# ceiling and 400-Bad-Request from vLLM. Qwen3.6-27B's native context is
+# 262144; 131072 (128K) leaves comfortable headroom for the longest agent
+# trajectories without paying the throughput hit of going wider.
+export VLLM_MAX_LEN="${VLLM_MAX_LEN:-131072}"
+
+# Per-turn output cap. Keep small so a single LLM step can't claim a huge
+# slice of the context window; 8192 is plenty for one bash command + thought.
+# Note: _vllm_wait_ready_local further auto-caps this to ~vllm_max_len/4.
+MAX_TOKENS="${MAX_TOKENS:-8192}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
 COMMAND_TIMEOUT=60
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
-BUILD_WORKERS=4
+# BUILD_WORKERS only matters when missing base SIFs need to be built. With
+# BASE_SIFS_DIR set and all 10 base SIFs already present, this is a no-op.
+# Bumped from 4 to 8 so future fresh builds on a multi-base node also
+# parallelise cleanly.
+BUILD_WORKERS="${BUILD_WORKERS:-8}"
 BUILD_RETRIES=3
 BASE_SIFS_DIR="${BASE_SIFS_DIR:-rl_data/containers}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
 LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
-WORKERS="${WORKERS:-12}"
-NUM_POOL_WORKERS="${NUM_POOL_WORKERS:-16}"
+# Concurrency model:
+#   * WORKERS           = concurrent TASKS at once.
+#   * NUM_POOL_WORKERS  = concurrent solutions / shell ops *within* one task.
+#                         Must be >= NUM_SOLUTIONS for full parallelism.
+#   * Total concurrent containers = WORKERS * NUM_SOLUTIONS.
+#
+# h200 nodes give 8 CPUs + ~240 GB RAM per GPU, so an 8×H200 allocation has
+# 64 CPUs + ~1.28 TB RAM. Rule of thumb (from run_generate_solutions_10k.sh):
+#   containers <= CPUs (1:1) baseline, up to 1.5x for I/O-heavy workloads.
+# With NUM_SOLUTIONS=4 the smoke fits 24 workers * 4 = 96 containers — right
+# at the 1.5x ceiling, which is fine because the agent loop is heavily
+# I/O-bound (LLM round-trip + bash exec, never CPU-pinned).
+# At SAMPLE_SIZE=25 this means almost the entire batch runs in one wave.
+WORKERS="${WORKERS:-24}"
+NUM_POOL_WORKERS="${NUM_POOL_WORKERS:-8}"
 
 export VLLM_TP="${VLLM_TP:-2}"
 # --------------------------------
@@ -165,12 +210,15 @@ uv run python -m rl_data.generate_solutions \
     --verbose \
     "${EXTRA_ARGS[@]}"
 
-# Final tally — read the 50 summaries we just produced and report aggregate
+# Final tally — read the summaries we just produced and report aggregate
 # pass@k. This is the single most useful number from the smoke run: if
-# vanillux's pass@1 on the existing 1k corpus is comparable to the legacy
-# bash run, the new harness is healthy.
+# vanillux's pass@1 is comparable to (or higher than) the legacy bash
+# baseline on the same tasks, the new harness is healthy. The summary file
+# matches the harness via _summary_basename in rl_data.generate_solutions:
+#   bash      -> <MODEL_TAG>_summary.json
+#   vanillux  -> <MODEL_TAG>_vanillux_summary.json
 echo
-echo "=== Summary across the ${SAMPLE_SIZE} sampled tasks ==="
+echo "=== Summary across the ${SAMPLE_SIZE} sampled tasks (harness=${HARNESS}) ==="
 uv run python <<PYEOF
 import json, math, glob, os, random
 
@@ -180,13 +228,22 @@ sample = random.sample(all_dirs, min($SAMPLE_SIZE, len(all_dirs)))
 sample = sorted(sample)
 
 model_tag = "$MODEL".replace("/", "_")
-summary_name = f"{model_tag}_summary.json"
+harness = "$HARNESS"
+# Mirror rl_data.generate_solutions._summary_basename: bash keeps the legacy
+# filename, non-bash gets a harness suffix.
+suffix = "" if harness == "bash" else f"_{harness}"
+summary_name = f"{model_tag}{suffix}_summary.json"
 
+# k for pass@k is dynamic — we report pass@N where N = the actual number of
+# solution attempts run for this task. The script-level NUM_SOLUTIONS is just
+# the upper bound; if some env-init failure shrunk a task's effective N, we
+# pick the per-task min so the math stays correct (and well-labelled).
 n_eval = 0
-n_pass1 = 0
-n_pass8 = 0
+sum_pass1 = 0.0
+sum_passk = 0.0
 n_skipped = 0
 solved_some = 0
+ks_observed = set()
 for d in sample:
     p = os.path.join(d, "solutions", summary_name)
     if not os.path.exists(p):
@@ -198,14 +255,20 @@ for d in sample:
     if n == 0:
         n_skipped += 1
         continue
+    ks_observed.add(n)
     n_eval += 1
-    n_pass1 += c / n
-    n_pass8 += 1 - math.comb(max(0, n-c), min(8, n)) / math.comb(n, min(8, n)) if c < n else 1.0
+    sum_pass1 += c / n
+    # pass@n unbiased estimator. With k = n, this collapses to "any succeeded".
+    sum_passk += 1.0 if c >= n else (1.0 - math.comb(n - c, n) / math.comb(n, n))
     if c > 0:
         solved_some += 1
+
+# Label pass@k with the modal k actually present in the run.
+k_label = max(ks_observed) if ks_observed else 0
+print(f"  summary file   : {summary_name}")
 print(f"  evaluated      : {n_eval} / {len(sample)}  (skipped {n_skipped})")
 if n_eval:
-    print(f"  mean pass@1    : {n_pass1 / n_eval:.3f}")
-    print(f"  mean pass@8    : {n_pass8 / n_eval:.3f}")
-    print(f"  pass@8 > 0     : {solved_some} / {n_eval}  ({solved_some / n_eval:.1%})")
+    print(f"  mean pass@1    : {sum_pass1 / n_eval:.3f}")
+    print(f"  mean pass@{k_label}    : {sum_passk / n_eval:.3f}")
+    print(f"  pass@{k_label} > 0     : {solved_some} / {n_eval}  ({solved_some / n_eval:.1%})")
 PYEOF

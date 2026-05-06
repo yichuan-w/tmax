@@ -13,8 +13,22 @@
 # ║                                                                            ║
 # ║  Mirror of run_generate_tasks_10k.sh, three differences:                   ║
 # ║    1. CORPUS_KIND=rl_v2 — enables verifier_kind / fixture_kind /           ║
-# ║       intricate-complexity sampling via the bucket-upweight formula        ║
-# ║       (M=1.5; ~60% of tasks have a non-legacy verifier kind, etc).         ║
+# ║       intricate-complexity sampling via the *per-axis* bucket-upweight     ║
+# ║       formula (see _CORPUS_MULTIPLIER in task_template_gen.py). The        ║
+# ║       multipliers are tuned so that this 5k v2 corpus, concatenated with   ║
+# ║       the legacy 10k corpus, gives a balanced-where-achievable 15k mix:    ║
+# ║         * task_complexity: M=3.0 → 75% intricate in v2 → 25/25/25/25       ║
+# ║           across the 4 buckets (short/moderate/complex/intricate) in 15k.  ║
+# ║         * verifier_kind: M=inf → v2 always samples uniformly from the 4    ║
+# ║           non-legacy verifier kinds (no `exact_text` from v2). 15k mix:    ║
+# ║           ~67% exact_text (from legacy), ~8.3% each new verifier.          ║
+# ║         * fixture_kind: M=inf → v2 always samples uniformly from the 6     ║
+# ║           non-legacy fixture kinds (no `text_only` from v2). 15k mix:      ║
+# ║           ~67% text_only (from legacy), ~5.5% each new fixture.            ║
+# ║       (verifier/fixture cannot be fully balanced at this generation        ║
+# ║       budget because the legacy 10k has a fixed 10k of `exact_text` /      ║
+# ║       `text_only` mass that 5k of v2 cannot outweigh; M=inf maximizes      ║
+# ║       coverage of the new buckets.)                                        ║
 # ║    2. NUM_TASKS=11000 — request 2x to land ~5k surviving tasks after the   ║
 # ║       4-stage pipeline-survival filter. Mirrors the 10k script's pattern.  ║
 # ║    3. OUT_DIR / job-name — separate output dir so the legacy 10k corpus    ║
@@ -28,8 +42,8 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-NUM_TASKS=11000
-OUT_DIR="rl_data/output/tasks_skill_tax_v2_rl_5k"
+NUM_TASKS=5500
+OUT_DIR="rl_data/output/tasks_skill_tax_v2_20260506_5k"
 MODEL="gemini/gemini-3.1-pro-preview"
 MAX_TOKENS=32768
 BATCH_SIZE=250
