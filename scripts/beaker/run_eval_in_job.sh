@@ -48,6 +48,23 @@ if ! command -v podman >/dev/null 2>&1; then
         netavark aardvark-dns curl git ca-certificates
 fi
 
+# Some images (e.g. AI2's cuda gantry images) ship a real Docker CLI without
+# the compose plugin. Harbor shells out to `docker compose ...`, so without
+# the plugin every up/down errors with "unknown shorthand flag: 'p' in -p"
+# (Docker CLI rejects `compose` as a subcommand and then mis-parses `-p`).
+# Drop in the official compose v2 static binary as a user-level CLI plugin —
+# it talks the Docker API, which podman serves on /tmp/podman.sock.
+if ! docker compose version >/dev/null 2>&1; then
+    log "installing docker compose v2 plugin"
+    DOCKER_COMPOSE_VERSION="${DOCKER_COMPOSE_VERSION:-v2.39.4}"
+    DOCKER_COMPOSE_ARCH="$(uname -m)"
+    mkdir -p /root/.docker/cli-plugins
+    curl -fsSL \
+        "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-${DOCKER_COMPOSE_ARCH}" \
+        -o /root/.docker/cli-plugins/docker-compose
+    chmod +x /root/.docker/cli-plugins/docker-compose
+fi
+
 # --- 2. Write containers.conf -----------------------------------------------
 log "writing /etc/containers/containers.conf"
 mkdir -p /etc/containers

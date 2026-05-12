@@ -131,6 +131,7 @@ Inside the beaker task, in order of when things fail:
 | Symptom | Where to look |
 |---|---|
 | Beaker task exits before any "===" log line | Beaker task log — likely apt-install or git clone. |
+| `unknown shorthand flag: 'p' in -p` from `docker compose down` | The image's `docker` CLI has no compose plugin. The script auto-installs Docker Compose v2 as a CLI plugin; if you see this anyway, check that `curl https://github.com/...` is reachable from your beaker network. |
 | `mknod` permission denied | The cluster doesn't grant CAP_MKNOD. Ask your beaker admin or use an image with `/dev/net/tun` pre-created. |
 | podman socket never appears | `/tmp/podman-service.log` for the daemon, then beaker task log. |
 | vLLM never becomes ready | `/tmp/vllm.log` (the inner script tails it on failure). |
