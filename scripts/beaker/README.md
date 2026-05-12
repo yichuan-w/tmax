@@ -65,7 +65,7 @@ A single task running:
    `DOCKER_HOST`.
 6. Launches vLLM in the background:
    ```
-   uvx vllm serve $MODEL_PATH --revision $MODEL_REVISION
+   uvx --from vllm==0.19.1 vllm serve $MODEL_PATH --revision $MODEL_REVISION
                 --served-model-name $SERVED_MODEL_NAME
                 --enable-auto-tool-choice --tool-call-parser hermes
                 --tensor-parallel-size $TP_SIZE
