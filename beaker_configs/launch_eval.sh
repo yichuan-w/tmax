@@ -171,6 +171,7 @@ GANTRY_CMD=(
     --weka "oe-adapt-default:/weka/oe-adapt-default"
     --upload "$REPO_ROOT/scripts/beaker:/uploaded-beaker-scripts"
     --env-secret HF_TOKEN
+    --env-secret "DOCKER_PAT=${DOCKER_PAT_SECRET:-hamishivi_DOCKER_PAT}"
     --env "MODEL_PATH=${MODEL_PATH}"
     --env "MODEL_REVISION=${REVISION}"
     --env "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"

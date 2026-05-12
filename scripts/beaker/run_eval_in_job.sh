@@ -172,6 +172,21 @@ if "agent_dir.chmod(0o777)" not in text:
     )
     paths_py.write_text(text)
     print("patched paths.py")
+
+# Drop --rmi all from compose-down: harbor deletes the image after every
+# trial, which makes each retry of a tb2 task re-pull from Docker Hub and
+# blows past the unauthenticated pull cap. Keeping images on local podman
+# storage costs ~9 GB total for tb2 (89 unique images) but eliminates the
+# re-pull storm entirely.
+docker_py = hdir / "environments/docker/docker.py"
+text = docker_py.read_text()
+if '["down", "--rmi", "all", "--volumes", "--remove-orphans"]' in text:
+    text = text.replace(
+        '["down", "--rmi", "all", "--volumes", "--remove-orphans"]',
+        '["down", "--volumes", "--remove-orphans"]',
+    )
+    docker_py.write_text(text)
+    print("patched docker.py: dropped --rmi all from compose down")
 PY
 
 # --- 4. Bring podman service up (uses scripts/setup_podman_harbor.sh) -------
@@ -179,6 +194,46 @@ log "starting podman service"
 # shellcheck disable=SC1091
 source scripts/setup_podman_harbor.sh
 export DOCKER_HOST="${DOCKER_HOST:-unix:///tmp/podman.sock}"
+
+# --- 4a. Docker Hub auth + mirror -------------------------------------------
+# tb2 task images live on Docker Hub; on a 267-trial run, harbor's
+# `compose down --rmi all` deletes each image after a trial, so the next
+# trial re-pulls and we blow past Docker Hub's 100 pulls/6hr unauthenticated
+# cap somewhere around trial 100 (whole 2nd half of the run fails with
+# "toomanyrequests: You have reached your unauthenticated pull rate limit").
+# Defense in depth:
+#   - if the image ships an internal Docker Hub mirror, use it
+#   - if DOCKER_PAT is set (beaker secret), write the auth config (200/6hr
+#     authenticated cap, or unlimited on a Docker Hub paid account)
+#   - --rmi all is dropped via the docker.py patch below (step 3 already
+#     ran, but the sed below is idempotent and safe to re-run)
+if [ -x /usr/local/bin/setup_dockerio_mirror ]; then
+    /usr/local/bin/setup_dockerio_mirror || log "setup_dockerio_mirror failed (continuing)"
+fi
+if [ -n "${DOCKER_PAT:-}" ]; then
+    log "writing Docker Hub credentials"
+    DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-hamishivi}"
+    python3 - <<PY
+import base64, json, os
+username = "$DOCKERHUB_USERNAME"
+pat = os.environ["DOCKER_PAT"]
+auth = base64.b64encode(f"{username}:{pat}".encode()).decode()
+cfg_dir = os.path.expanduser("~/.docker")
+os.makedirs(cfg_dir, exist_ok=True)
+cfg_path = os.path.join(cfg_dir, "config.json")
+cfg = {}
+if os.path.exists(cfg_path):
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        cfg = {}
+cfg.setdefault("auths", {})["https://index.docker.io/v1/"] = {"auth": auth}
+json.dump(cfg, open(cfg_path, "w"), indent=2)
+print(f"wrote {cfg_path}")
+PY
+else
+    log "DOCKER_PAT not set — Docker Hub pulls will be rate-limited (100/6hr)"
+fi
 
 # --- 5. Start vLLM in the background ----------------------------------------
 : "${VLLM_VERSION:=0.19.1}"
