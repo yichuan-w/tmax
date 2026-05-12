@@ -216,16 +216,17 @@ fi
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 export OPENAI_API_BASE="http://localhost:$VLLM_PORT/v1"
 
-log "running harbor on $DATASET with $AGENT_IMPORT_PATH @ $SERVED_MODEL_NAME"
-uv run harbor run \
-    --dataset "$DATASET" \
-    --agent-import-path "$AGENT_IMPORT_PATH" \
-    --model "hosted_vllm/$SERVED_MODEL_NAME" \
-    --env docker \
-    --n-concurrent "$N_CONCURRENT" \
-    --agent-kwarg "api_base=http://localhost:$VLLM_PORT/v1" \
-    --job-name "$JOB_NAME" \
-    -k "$N_ATTEMPTS"
+HARBOR_CMD=( uv run harbor run
+             --dataset "$DATASET"
+             --agent-import-path "$AGENT_IMPORT_PATH"
+             --model "hosted_vllm/$SERVED_MODEL_NAME"
+             --env docker
+             --n-concurrent "$N_CONCURRENT"
+             --agent-kwarg "api_base=http://localhost:$VLLM_PORT/v1"
+             --job-name "$JOB_NAME"
+             -k "$N_ATTEMPTS" )
+log "running harbor: ${HARBOR_CMD[*]}"
+"${HARBOR_CMD[@]}"
 HARBOR_RC=$?
 
 # --- 7. Persist results to /weka --------------------------------------------
