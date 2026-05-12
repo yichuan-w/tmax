@@ -247,8 +247,46 @@ HARBOR_CMD=( uv run harbor run
              --job-name "$JOB_NAME"
              -k "$N_ATTEMPTS" )
 log "running harbor: ${HARBOR_CMD[*]}"
+
+# Background progress reporter — harbor's built-in progress bar uses ANSI
+# escapes that gantry logs flatten into noise, so we tail result.json
+# ourselves and emit one human-readable line per interval.
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-60}"
+RESULT_JSON="jobs/$JOB_NAME/result.json"
+(
+    while true; do
+        sleep "$PROGRESS_INTERVAL"
+        [ -f "$RESULT_JSON" ] || continue
+        python3 - "$RESULT_JSON" <<'PY' || true
+import json, sys, datetime
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+total = d.get("n_total_trials", "?")
+stats = d.get("stats", {}) or {}
+done = stats.get("n_trials", 0)
+errs = stats.get("n_errors", 0)
+evals = stats.get("evals", {}) or {}
+mean = 0.0
+for v in evals.values():
+    m = (v.get("metrics") or [{}])[0].get("mean")
+    if m is not None:
+        mean = m
+        break
+ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
+print(f"=== [{ts}] progress: {done}/{total} trials  errors={errs}  mean={mean:.3f} ===",
+      flush=True)
+PY
+    done
+) &
+PROGRESS_PID=$!
+
 "${HARBOR_CMD[@]}"
 HARBOR_RC=$?
+
+kill "$PROGRESS_PID" 2>/dev/null || true
+wait "$PROGRESS_PID" 2>/dev/null || true
 
 # --- 7. Persist results to /weka --------------------------------------------
 if [ -n "${RESULTS_DIR:-}" ]; then
