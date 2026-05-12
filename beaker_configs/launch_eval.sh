@@ -48,7 +48,7 @@ CLUSTER="ai2/saturn"
 BUDGET=""
 PRIORITY="high"
 BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/tmax}"
-BEAKER_IMAGE="ai2/cuda12.8-dev-ubuntu22.04-torch2.10.0"
+BEAKER_IMAGE="hamishivi/hamishivi-interactive"
 REPO_GIT_URL=""
 REPO_GIT_REF=""
 
