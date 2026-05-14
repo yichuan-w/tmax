@@ -54,6 +54,10 @@ _COMPOSE_PROVIDER_RE = re.compile(
     r'"[^"]*docker-compose"\. Please see podman-compose\(1\) for how to disable '
     r"this message\. <<<<\n\n\x1b\[0m"
 )
+_DOCKER_EXEC_ERROR_RE = re.compile(
+    r"(?ms)^Error: executing [^\n]*(?:docker-compose|docker compose)"
+    r".*?: exit status \d+\s*$"
+)
 
 
 class Vanillux2Agent(BaseAgent):
@@ -314,5 +318,6 @@ class Vanillux2Agent(BaseAgent):
         if result.stderr:
             output += f"\n{result.stderr}" if output else result.stderr
         output = _COMPOSE_PROVIDER_RE.sub("", output)
+        output = _DOCKER_EXEC_ERROR_RE.sub("", output).rstrip()
         truncated = _truncate_observation(output) if output else "(no output)"
         return f"{truncated}\n\n(exit_code={result.return_code})"
