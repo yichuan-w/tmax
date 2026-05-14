@@ -73,7 +73,7 @@ class Vanillux2Agent(BaseAgent):
         max_steps: int = 64,
         temperature: float = 0.7,
         top_p: float = 0.95,
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         cost_limit: float = 0.0,
         api_base: str | None = None,
         command_timeout: int = 120,
