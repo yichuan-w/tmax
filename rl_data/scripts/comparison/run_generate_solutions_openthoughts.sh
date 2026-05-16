@@ -10,7 +10,13 @@
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
 # ║  Run our solution-generation harness on the (converted) OpenThoughts- ║
-# ║  Agent-v1-RL dataset, using THE SAME model+settings as our 10k run.    ║
+# ║  Agent-v1-RL dataset under the VANILLUX harness, using the uniform   ║
+# ║  comparison config (NUM_SOLUTIONS=8, MAX_ACTIONS=64,                 ║
+# ║  COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed SAMPLE_SEED=0). Same    ║
+# ║  config as the rebased skill-tax reference + every other baseline.   ║
+# ║                                                                        ║
+# ║  Output: per-task                                                      ║
+# ║    <task>/solutions/<MODEL_TAG>_vanillux_summary.json                  ║
 # ║                                                                        ║
 # ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_openthoughts.sh║
 # ║  once to extract 728 tasks into TASKS_DIR. This script then prebuilds  ║
@@ -25,18 +31,22 @@ set -euo pipefail
 TASKS_DIR="rl_data/output/tasks_openthoughts_agent_rl"
 # Override via env (see run_generate_solutions_et.sh header for examples).
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
-# NUM_SOLUTIONS controls pass@k breadth.  run_n_solutions() returns pass@k for
-# every k in [1..N], so NUM_SOLUTIONS=8 gives both pass@1 and pass@8 in one run.
-# Default 1 matches the 10k gemini run; override via env (e.g. NUM_SOLUTIONS=8).
-NUM_SOLUTIONS="${NUM_SOLUTIONS:-1}"
-MAX_ACTIONS=16
+# Solution-sampling harness. See run_generate_solutions_et.sh for the 0515
+# rebase rationale; every comparison baseline is now vanillux by default.
+HARNESS="${HARNESS:-vanillux}"
+# 8 attempts/task = pass@1/4/8 in one run. Uniform across all 5 datasets.
+NUM_SOLUTIONS="${NUM_SOLUTIONS:-8}"
+# 64 = vanillux convention; the mini-swe-agent prompts need the larger budget.
+MAX_ACTIONS="${MAX_ACTIONS:-64}"
 # MAX_TOKENS is the per-turn generation cap.  Gemini default 65536; auto-capped
 # to VLLM_MAX_LEN-safety_margin when LAUNCH_VLLM=1 (see _vllm_wait_ready_local).
 MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=60
+# 600s matches the vanillux reference script (was 60 in the pre-0515
+# comparison; insufficient for the heavier OT tasks under 8-way parallelism).
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-600}"
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=12
@@ -45,8 +55,9 @@ FORCE_RERUN=0
 LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
-# Optional cost-bounded subsample: set SAMPLE_SIZE=250 (or similar) in env.
-SAMPLE_SIZE="${SAMPLE_SIZE:-0}"
+# Cost-bounded subsample: 250 tasks (uniform across all 5 datasets).
+# Fixed seed=0 so the same 250 OT tasks are picked on every rerun.
+SAMPLE_SIZE="${SAMPLE_SIZE:-250}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
 # WORKERS = concurrent TASKS processed at once.  NUM_POOL_WORKERS = concurrent
@@ -183,7 +194,9 @@ fi
 _vllm_wait_ready_local
 
 _MODEL_TAG=$(echo "$MODEL" | tr '/' '_')
-TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${_RUN_TS}.log"
+# Include $HARNESS in the log filename so vanillux reruns don't clobber legacy
+# bash-harness logs from earlier comparison runs.
+TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${HARNESS}_${_RUN_TS}.log"
 
 EXTRA_ARGS=()
 if [[ "${FORCE_RERUN:-0}" == "1" ]]; then
@@ -204,7 +217,7 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== OpenThoughts-Agent-v1-RL comparison run: MODEL=${MODEL}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS} ==="
+echo "=== OpenThoughts-Agent-v1-RL comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
 echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \
@@ -223,5 +236,6 @@ uv run python -m rl_data.generate_solutions \
     --shell-init-attempts "$SHELL_INIT_ATTEMPTS" \
     --build-workers "$BUILD_WORKERS" \
     --build-retries "$BUILD_RETRIES" \
+    --harness "$HARNESS" \
     --verbose \
     "${EXTRA_ARGS[@]}"

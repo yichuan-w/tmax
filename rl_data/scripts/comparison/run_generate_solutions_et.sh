@@ -10,8 +10,17 @@
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
 # ║  Run our solution-generation harness on the (converted) Endless-     ║
-# ║  Terminals dataset, using THE SAME model+settings as our 10k run so  ║
-# ║  head-to-head comparison is apples-to-apples.                        ║
+# ║  Terminals dataset under the VANILLUX harness, using the uniform     ║
+# ║  comparison config (NUM_SOLUTIONS=8, MAX_ACTIONS=64,                 ║
+# ║  COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed SAMPLE_SEED=0). This is ║
+# ║  the same config used by the rebased skill-tax reference run + every ║
+# ║  other baseline in this directory, so head-to-head pass@1/4/8 is     ║
+# ║  apples-to-apples across all 5 datasets.                              ║
+# ║                                                                       ║
+# ║  Output: per-task                                                     ║
+# ║    <task>/solutions/<MODEL_TAG>_vanillux_summary.json                 ║
+# ║  (the legacy `<MODEL_TAG>_summary.json` bash-harness files, if any,   ║
+# ║  are preserved alongside since the filenames are disjoint).           ║
 # ║                                                                       ║
 # ║  Prerequisite: run ingest_endless_terminals.py to populate TASKS_DIR. ║
 # ║  ET does NOT use shared base SIFs (its container.defs are self-       ║
@@ -29,11 +38,20 @@ TASKS_DIR="rl_data/output/tasks_endless_terminals"
 #   Ollama:      MODEL="ollama_chat/qwen2.5-coder:7b" \
 #                OLLAMA_API_BASE="http://localhost:11434"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
-# NUM_SOLUTIONS controls pass@k breadth.  run_n_solutions() returns pass@k for
-# every k in [1..N], so NUM_SOLUTIONS=8 gives both pass@1 and pass@8 in one run.
-# Default 1 matches the 10k gemini run; override via env (e.g. NUM_SOLUTIONS=8).
-NUM_SOLUTIONS="${NUM_SOLUTIONS:-1}"
-MAX_ACTIONS=16
+# Solution-sampling harness. The 0515 comparison rebase pinned every baseline
+# to the mini-swe-agent-style 'vanillux' harness so the head-to-head against
+# our (also-vanillux) reference run is apples-to-apples. Override to 'bash'
+# only if you specifically want to reproduce the pre-0515 results.
+HARNESS="${HARNESS:-vanillux}"
+# NUM_SOLUTIONS controls pass@k breadth. run_n_solutions{,_vanillux}() returns
+# pass@k for every k in [1..N], so NUM_SOLUTIONS=8 lights up pass@1/4/8 in one
+# run. Uniform across all five comparison datasets.
+NUM_SOLUTIONS="${NUM_SOLUTIONS:-8}"
+# 64 = vanillux convention (matches the mini-swe-agent "Recommended Workflow"
+# budget and the upstream VanilluxAgent per_instance_call_limit). The legacy
+# bash baselines used 16; raising it here is required for the vanillux prompts
+# to play out, not just a nice-to-have.
+MAX_ACTIONS="${MAX_ACTIONS:-64}"
 # MAX_TOKENS is the per-turn generation cap.  65536 was chosen for gemini-3
 # flash (1M-token context).  For a local vLLM with --max-model-len=32768 it
 # would be rejected with `max_tokens > max_model_len`, so the helper's
@@ -43,7 +61,10 @@ MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=60
+# 600s matches the vanillux reference script. 60s was the old comparison
+# default; with 8 parallel solutions hammering an ET container's setup it was
+# producing spurious timeouts on the heavier tasks.
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-600}"
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=12
@@ -53,9 +74,11 @@ FORCE_RERUN=0
 LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
-# Optional cost-bounded subsample. Set SAMPLE_SIZE=250 (or similar) in the
-# environment to randomly pick N tasks rather than processing the whole set.
-SAMPLE_SIZE="${SAMPLE_SIZE:-0}"
+# Cost-bounded subsample: 250 tasks × 8 attempts = 2000 trajectories per
+# dataset, uniform across all 5 comparison corpora. Fixed seed=0 so the same
+# 250 ET tasks are picked on every rerun (and stay stable if anyone adds new
+# ET tasks upstream).
+SAMPLE_SIZE="${SAMPLE_SIZE:-250}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
 # WORKERS = concurrent TASKS processed at once.  NUM_POOL_WORKERS = concurrent
@@ -185,8 +208,10 @@ fi
 _vllm_wait_ready_local
 
 # Derive model-tagged paths NOW (after the helper may have rewritten MODEL).
+# Include $HARNESS in the log filename so a vanillux rerun doesn't clobber
+# legacy bash-harness logs from earlier comparison runs.
 _MODEL_TAG=$(echo "$MODEL" | tr '/' '_')
-TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${_RUN_TS}.log"
+TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${HARNESS}_${_RUN_TS}.log"
 
 EXTRA_ARGS=()
 if [[ "${FORCE_RERUN:-0}" == "1" ]]; then
@@ -207,7 +232,7 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== ET comparison run: MODEL=${MODEL}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS} ==="
+echo "=== ET comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
 echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \
@@ -226,5 +251,6 @@ uv run python -m rl_data.generate_solutions \
     --shell-init-attempts "$SHELL_INIT_ATTEMPTS" \
     --build-workers "$BUILD_WORKERS" \
     --build-retries "$BUILD_RETRIES" \
+    --harness "$HARNESS" \
     --verbose \
     "${EXTRA_ARGS[@]}"

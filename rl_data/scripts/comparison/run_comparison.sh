@@ -8,9 +8,13 @@
 #                         scripts/run_ingest_terminaltraj.sh)
 #   2. Classify external tasks into OUR taxonomy via an LLM
 #      (scripts/run_classify_taxonomy.sh)
-#   3. Run our solution harness on each baseline with the same model as the 10k
-#      (scripts/run_generate_solutions_{et,openthoughts,termigen,terminaltraj}.sh)
-#   4. Compare (python -m rl_data.comparison.cli)
+#   3. Run our solution harness on each baseline + our rebased reference
+#      under a uniform config (vanillux harness, NUM_SOLUTIONS=8,
+#      MAX_ACTIONS=64, COMMAND_TIMEOUT=600, SAMPLE_SIZE=250) so head-to-
+#      head pass@1/4/8 is apples-to-apples across all 5 datasets. See
+#      scripts/run_generate_solutions_{et,openthoughts,termigen,terminaltraj,
+#      skill_tax_combined_legacy10k_new5k}.sh.
+#   4. Compare (python -m rl_data.comparison.cli --harness $HARNESS)
 #
 # Each stage can be skipped with SKIP_* env vars. Typical flow:
 #
@@ -18,29 +22,32 @@
 #   bash rl_data/scripts/comparison/run_comparison.sh                 # full pipeline
 #
 # Env toggles:
-#   OURS_TASKS_DIR         Default: rl_data/output/tasks_skill_tax_20260401_10k
+#   OURS_TASKS_DIR         Default: rl_data/output/tasks_skill_tax_combined_20260506_legacy10k_new5k
 #   ET_TASKS_DIR           Default: rl_data/output/tasks_endless_terminals
 #   OT_TASKS_DIR           Default: rl_data/output/tasks_openthoughts_agent_rl
 #   TG_TASKS_DIR           Default: rl_data/output/tasks_termigen
 #   TT_TASKS_DIR           Default: rl_data/output/tasks_terminaltraj
-#   COMPARE_OUT_DIR        Default: rl_data/output/comparison
+#   COMPARE_OUT_DIR        Default: rl_data/output/comparison_vanillux_0515
 #   MODEL                  Default: gemini/gemini-3-flash-preview
+#   HARNESS                Default: vanillux  (set to 'bash' to read legacy
+#                          <MODEL>_summary.json files from a pre-0515 run)
 #
 # Stage skips:
 #   SKIP_INGEST_ET=1, SKIP_INGEST_OT=1, SKIP_INGEST_TG=1, SKIP_INGEST_TT=1
 #   SKIP_CLASSIFY=1
-#   SKIP_SOLVE_ET=1, SKIP_SOLVE_OT=1, SKIP_SOLVE_TG=1, SKIP_SOLVE_TT=1
+#   SKIP_SOLVE_OURS=1, SKIP_SOLVE_ET=1, SKIP_SOLVE_OT=1, SKIP_SOLVE_TG=1, SKIP_SOLVE_TT=1
 #   SKIP_COMPARE=1
 
 set -euo pipefail
 
-OURS_TASKS_DIR="${OURS_TASKS_DIR:-rl_data/output/tasks_skill_tax_20260401_10k}"
+OURS_TASKS_DIR="${OURS_TASKS_DIR:-rl_data/output/tasks_skill_tax_combined_20260506_legacy10k_new5k}"
 ET_TASKS_DIR="${ET_TASKS_DIR:-rl_data/output/tasks_endless_terminals}"
 OT_TASKS_DIR="${OT_TASKS_DIR:-rl_data/output/tasks_openthoughts_agent_rl}"
 TG_TASKS_DIR="${TG_TASKS_DIR:-rl_data/output/tasks_termigen}"
 TT_TASKS_DIR="${TT_TASKS_DIR:-rl_data/output/tasks_terminaltraj}"
-COMPARE_OUT_DIR="${COMPARE_OUT_DIR:-rl_data/output/comparison}"
+COMPARE_OUT_DIR="${COMPARE_OUT_DIR:-rl_data/output/comparison_vanillux_0515}"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
+HARNESS="${HARNESS:-vanillux}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -53,6 +60,7 @@ echo "  OT           : $OT_TASKS_DIR"
 echo "  TermiGen     : $TG_TASKS_DIR"
 echo "  TerminalTraj : $TT_TASKS_DIR"
 echo "  model        : $MODEL"
+echo "  harness      : $HARNESS"
 echo "  out-dir      : $COMPARE_OUT_DIR"
 echo
 
@@ -83,20 +91,32 @@ echo
 # fi
 
 # # ── 3. Solve ───────────────────────────────────────────────────────────
+# # Each of the five solve scripts already exports the uniform comparison
+# # config (HARNESS=vanillux, NUM_SOLUTIONS=8, MAX_ACTIONS=64,
+# # COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, SAMPLE_SEED=0) as its default, so
+# # uncommenting these calls is enough to reproduce the 0515 run. In
+# # practice you'll want to sbatch each one onto a dedicated node rather
+# # than run them serially here (each writes into its own TASKS_DIR, so
+# # they can all run in parallel on different nodes without conflict).
+# if [[ "${SKIP_SOLVE_OURS:-0}" != "1" ]]; then
+#   echo ">>> 3a. Solving skill-tax combined (legacy10k + new5k) — OURS reference"
+#   TASKS_DIR="$OURS_TASKS_DIR" \
+#       bash "$SCRIPT_DIR/run_generate_solutions_skill_tax_combined_legacy10k_new5k.sh"
+# fi
 # if [[ "${SKIP_SOLVE_ET:-0}" != "1" ]]; then
-#   echo ">>> 3a. Solving endless-terminals (prefer Slurm for the real run)"
+#   echo ">>> 3b. Solving endless-terminals (prefer Slurm for the real run)"
 #   bash "$SCRIPT_DIR/run_generate_solutions_et.sh"
 # fi
 # if [[ "${SKIP_SOLVE_OT:-0}" != "1" ]]; then
-#   echo ">>> 3b. Solving OpenThoughts-Agent-v1-RL (prefer Slurm for the real run)"
+#   echo ">>> 3c. Solving OpenThoughts-Agent-v1-RL (prefer Slurm for the real run)"
 #   bash "$SCRIPT_DIR/run_generate_solutions_openthoughts.sh"
 # fi
 # if [[ "${SKIP_SOLVE_TG:-0}" != "1" ]]; then
-#   echo ">>> 3c. Solving TermiGen (prefer Slurm for the real run)"
+#   echo ">>> 3d. Solving TermiGen (prefer Slurm for the real run)"
 #   bash "$SCRIPT_DIR/run_generate_solutions_termigen.sh"
 # fi
 # if [[ "${SKIP_SOLVE_TT:-0}" != "1" ]]; then
-#   echo ">>> 3d. Solving TerminalTraj (prefer Slurm for the real run)"
+#   echo ">>> 3e. Solving TerminalTraj (prefer Slurm for the real run)"
 #   bash "$SCRIPT_DIR/run_generate_solutions_terminaltraj.sh"
 # fi
 
@@ -121,6 +141,7 @@ if [[ "${SKIP_COMPARE:-0}" != "1" ]]; then
       --reference "skill_tax:$OURS_TASKS_DIR" \
       "${BASELINE_ARGS[@]}" \
       --model "$MODEL" \
+      --harness "$HARNESS" \
       --out-dir "$COMPARE_OUT_DIR"
 fi
 

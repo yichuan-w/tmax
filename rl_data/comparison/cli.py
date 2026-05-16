@@ -109,6 +109,15 @@ def parse_args() -> argparse.Namespace:
         help="<name>:<path_to_tasks_dir> for a baseline (repeatable)",
     )
     ap.add_argument("--model", type=str, default="gemini/gemini-3-flash-preview")
+    ap.add_argument(
+        "--harness", type=str, default="bash", choices=["bash", "vanillux"],
+        help=(
+            "Which solution-sampling harness's per-task summaries to consume. "
+            "'bash' (default) reads legacy <MODEL_TAG>_summary.json files; "
+            "'vanillux' reads <MODEL_TAG>_vanillux_summary.json files produced "
+            "by --harness vanillux runs of rl_data.generate_solutions."
+        ),
+    )
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument(
         "--modules", type=str, default=",".join(ALL_MODULES.keys()),
@@ -174,8 +183,17 @@ def _write_summary_table(report: Dict[str, Any], specs: List[DatasetSpec],
             "|---|" + "---:|" * (len(display) + len(names) - 1),
         ]
         p_vs = d.get("p_values_vs_reference", {})
+        # Map summary-row -> p_values key. Metrics not in this map render "-"
+        # in every p-value column (e.g. median, token counts).
+        _METRIC_TO_PKEY = {
+            "mean_pass_at_1": "pass@1",
+            "mean_pass_at_4": "pass@4",
+            "mean_pass_at_8": "pass@8",
+            "mean_turns": "avg_turns",
+        }
         for metric_key, label in [
             ("mean_pass_at_1", "Mean pass@1"),
+            ("mean_pass_at_4", "Mean pass@4"),
             ("mean_pass_at_8", "Mean pass@8"),
             ("mean_turns", "Mean turns"),
             ("median_turns", "Median turns"),
@@ -195,9 +213,7 @@ def _write_summary_table(report: Dict[str, Any], specs: List[DatasetSpec],
                 + " | "
                 + " | ".join(
                     fmt_p((p_vs.get(n) or {}).get(
-                        {"mean_pass_at_1": "pass@1",
-                         "mean_pass_at_8": "pass@8",
-                         "mean_turns": "avg_turns"}.get(metric_key, "")
+                        _METRIC_TO_PKEY.get(metric_key, "")
                     ))
                     for n in names[1:]
                 )
@@ -491,13 +507,19 @@ def _write_paper_snippets(report: Dict[str, Any], specs: List[DatasetSpec],
 def _dump_per_task_metrics(specs: List[DatasetSpec],
                            records_by_name: Dict[str, List[Dict[str, Any]]],
                            model_slug: str,
+                           harness: str,
                            path: Path) -> None:
     from rl_data.comparison.modules import _load_trace_features
     rows = []
     for spec in specs:
         for r in records_by_name[spec.name]:
             tj = r.get("_task_json") or {}
-            feats = _load_trace_features(Path(r["dir"]), model_slug) or {}
+            feats = _load_trace_features(Path(r["dir"]), model_slug, harness) or {}
+            # pass@K (K>1) lives in pass_at_k_full (see analyze._load_summary);
+            # only pass@1 is materialised as a top-level record key. Look up the
+            # dense form here so per-task CSV stays consistent with the summary
+            # table.
+            pak = r.get("pass_at_k_full") or {}
             rows.append({
                 "dataset": spec.name,
                 "task_name": r.get("name"),
@@ -512,7 +534,8 @@ def _dump_per_task_metrics(specs: List[DatasetSpec],
                 "num_runs": r.get("num_runs", 0),
                 "num_success": r.get("num_success", 0),
                 "pass@1": r.get("pass@1"),
-                "pass@8": r.get("pass@8"),
+                "pass@4": pak.get(4),
+                "pass@8": pak.get(8),
                 "avg_turns": r.get("avg_turns"),
                 "total_input_tokens": r.get("total_input_tokens"),
                 "total_output_tokens": r.get("total_output_tokens"),
@@ -562,11 +585,11 @@ def main() -> None:
     # Load records.
     records_by_name: Dict[str, List[Dict[str, Any]]] = {}
     for spec in specs:
-        recs = load_records(spec, model_slug)
+        recs = load_records(spec, model_slug, harness=args.harness)
         if args.max_tasks and args.max_tasks > 0:
             recs = recs[: args.max_tasks]
-        logger.info("Loaded %d records for %s (from %s)",
-                    len(recs), spec.name, spec.tasks_dir)
+        logger.info("Loaded %d records for %s (harness=%s, from %s)",
+                    len(recs), spec.name, args.harness, spec.tasks_dir)
         records_by_name[spec.name] = recs
 
     ctx = RunContext(
@@ -576,6 +599,7 @@ def main() -> None:
         main_dir=main_dir,
         appendix_dir=appendix_dir,
         sample_pairs=args.sample_pairs,
+        harness=args.harness,
     )
 
     modules_to_run = [m.strip() for m in args.modules.split(",") if m.strip()]
@@ -612,7 +636,7 @@ def main() -> None:
         json.dumps(_jsonable(report), indent=2, default=str)
     )
     _dump_per_task_metrics(
-        specs, records_by_name, model_slug,
+        specs, records_by_name, model_slug, args.harness,
         appendix_dir / "per_task_metrics.csv",
     )
     logger.info("Done. Outputs under %s", out_dir)

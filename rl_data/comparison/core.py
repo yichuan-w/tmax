@@ -30,7 +30,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Reuse the existing per-task loader from analyze.py to keep summary parsing
-# in one place.
+# in one place. We also re-use its summary-basename convention so the bash
+# vs. vanillux filename layout stays in one place.
+from rl_data.analyze import _summary_basename as _analyze_summary_basename
 from rl_data.analyze import load_tasks  # noqa: F401 (re-exported)
 
 logger = logging.getLogger(__name__)
@@ -183,13 +185,33 @@ COMMAND_COMPLEXITY_ORDER = ["bash-only", "bash+code", "bash+code+services"]
 # ---------------------------------------------------------------------------
 
 
-def load_records(spec: DatasetSpec, model_slug: str) -> List[Dict[str, Any]]:
+def summary_basename(model_slug: str, harness: str = "bash") -> str:
+    """Return the per-task solutions-summary filename for a (model, harness)
+    pair, mirroring :func:`rl_data.generate_solutions._summary_basename`.
+
+    Bash runs keep the legacy ``<MODEL_TAG>_summary.json`` name (no harness
+    suffix); vanillux runs land at ``<MODEL_TAG>_vanillux_summary.json`` so
+    bash and vanillux summaries can coexist in the same task dir.
+    """
+    return _analyze_summary_basename(model_slug, harness)
+
+
+def load_records(
+    spec: DatasetSpec,
+    model_slug: str,
+    harness: str = "bash",
+) -> List[Dict[str, Any]]:
     """Hydrate per-task records for a single dataset.
 
     Wraps :func:`rl_data.analyze.load_tasks` so we can inject the cached
     ``task.json`` dict and tag the ``dataset`` origin.
+
+    The ``harness`` argument controls which summary file is loaded per task
+    (see :func:`summary_basename`); pass ``"vanillux"`` to consume the
+    mini-swe-agent-style summaries produced by
+    :func:`rl_data.generator.vanillux_solver.run_n_solutions_vanillux`.
     """
-    records = load_tasks(spec.tasks_dir, model_slug=model_slug)
+    records = load_tasks(spec.tasks_dir, model_slug=model_slug, harness=harness)
     for r in records:
         attach_task_json(r)
         r["dataset"] = spec.name
@@ -448,6 +470,18 @@ class RunContext:
     appendix_dir: Path
     sample_pairs: int = 2000
     seed: int = 0
+    # Harness whose ``<MODEL_TAG>[_<HARNESS>]_summary.json`` files we want
+    # the modules to read from. Defaults to ``"bash"`` for backwards compat
+    # with the pre-0515 comparison runs.
+    harness: str = "bash"
+
+    @property
+    def summary_basename(self) -> str:
+        """Per-task summary filename (e.g. ``<MODEL>_vanillux_summary.json``)
+        for the (model, harness) pair this context is configured for. Use
+        this everywhere a module needs to load a per-task solutions summary,
+        so bash vs. vanillux dispatch happens in exactly one place."""
+        return summary_basename(self.model_slug, self.harness)
 
     @property
     def reference(self) -> DatasetSpec:

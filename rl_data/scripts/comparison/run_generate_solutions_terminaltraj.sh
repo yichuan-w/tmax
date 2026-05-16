@@ -10,9 +10,13 @@
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
 # ║  Run our solution-generation harness on the (converted) TerminalTraj  ║
-# ║  (m-a-p/TerminalTraj-5k-instances) dataset, using THE SAME model +   ║
-# ║  settings as our 10k run so head-to-head comparison is apples-to-    ║
-# ║  apples.                                                              ║
+# ║  (m-a-p/TerminalTraj-5k-instances) dataset under the VANILLUX        ║
+# ║  harness, using the uniform comparison config (NUM_SOLUTIONS=8,      ║
+# ║  MAX_ACTIONS=64, COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed         ║
+# ║  SAMPLE_SEED=0).                                                      ║
+# ║                                                                        ║
+# ║  Output: per-task                                                      ║
+# ║    <task>/solutions/<MODEL_TAG>_vanillux_summary.json                  ║
 # ║                                                                        ║
 # ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_terminaltraj.sh
 # ║  once to populate TASKS_DIR (downloads + extracts the 13 MB tarball). ║
@@ -40,8 +44,8 @@
 # ║     get-pip.py), so the SIFs we build here ship with pytest baked   ║
 # ║     in and `apptainer exec <sif> pytest ...` just works.             ║
 # ║                                                                        ║
-# ║  4. DISK: 5,660 SIFs × ~500 MB ≈ 2.8 TB. Strongly consider setting   ║
-# ║     SAMPLE_SIZE to bound the run (defaults to 500 = ~250 GB).        ║
+# ║  4. DISK: 5,660 SIFs × ~500 MB ≈ 2.8 TB. SAMPLE_SIZE=250 (the new    ║
+# ║     uniform-comparison default) caps this to ~125 GB.                 ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -53,18 +57,22 @@ TASKS_DIR="rl_data/output/tasks_terminaltraj"
 #   Local vLLM:  MODEL="hosted_vllm/Qwen/Qwen2.5-Coder-7B-Instruct" \
 #                HOSTED_VLLM_API_BASE="http://localhost:8000/v1"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
-# NUM_SOLUTIONS controls pass@k breadth.  run_n_solutions() returns pass@k for
-# every k in [1..N], so NUM_SOLUTIONS=8 gives both pass@1 and pass@8 in one run.
-# Default 1 matches the 10k gemini run; override via env (e.g. NUM_SOLUTIONS=8).
-NUM_SOLUTIONS="${NUM_SOLUTIONS:-1}"
-MAX_ACTIONS=16
+# Solution-sampling harness. See run_generate_solutions_et.sh for the 0515
+# rebase rationale; every comparison baseline is now vanillux by default.
+HARNESS="${HARNESS:-vanillux}"
+# 8 attempts/task = pass@1/4/8 in one run. Uniform across all 5 datasets.
+NUM_SOLUTIONS="${NUM_SOLUTIONS:-8}"
+# 64 = vanillux convention; the mini-swe-agent prompts need the larger budget.
+MAX_ACTIONS="${MAX_ACTIONS:-64}"
 # MAX_TOKENS is the per-turn generation cap.  Gemini default 65536; auto-capped
 # to VLLM_MAX_LEN-safety_margin when LAUNCH_VLLM=1 (see _vllm_wait_ready_local).
 MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=60
+# 600s matches the vanillux reference script (was 60 pre-0515; insufficient
+# under 8-way parallelism on these heterogeneous base images).
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-600}"
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=12
@@ -73,10 +81,10 @@ FORCE_RERUN=0
 LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
-# STRONGLY RECOMMENDED: bound the run or you'll pull ~2.8 TB of Docker layers.
-# Default matches the OT run we did previously (500 tasks @ ~51 min wall time
-# for the solve phase on h200_s2, plus ~2-5 min/task for SIF prebuild).
-SAMPLE_SIZE="${SAMPLE_SIZE:-500}"
+# Cost-bounded subsample: 250 tasks (uniform across all 5 datasets, down from
+# 500 in the pre-0515 TT-only run). Fixed seed=0 so the same 250 TT tasks are
+# picked on every rerun.  Disk budget: 250 × ~500MB SIFs ≈ 125 GB.
+SAMPLE_SIZE="${SAMPLE_SIZE:-250}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
 # WORKERS = concurrent TASKS processed at once.  NUM_POOL_WORKERS = concurrent
@@ -246,7 +254,9 @@ echo "=== TerminalTraj pre-build done: ${_BUILT}/${TT_N} SIFs ready ==="
 _vllm_wait_ready_local
 
 _MODEL_TAG=$(echo "$MODEL" | tr '/' '_')
-TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${_RUN_TS}.log"
+# Include $HARNESS in the log filename so vanillux reruns don't clobber legacy
+# bash-harness logs from earlier comparison runs.
+TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${HARNESS}_${_RUN_TS}.log"
 
 EXTRA_ARGS=()
 if [[ "${FORCE_RERUN:-0}" == "1" ]]; then
@@ -267,7 +277,7 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== TerminalTraj comparison run: MODEL=${MODEL}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS} ==="
+echo "=== TerminalTraj comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
 echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \
@@ -286,5 +296,6 @@ uv run python -m rl_data.generate_solutions \
     --shell-init-attempts "$SHELL_INIT_ATTEMPTS" \
     --build-workers "$BUILD_WORKERS" \
     --build-retries "$BUILD_RETRIES" \
+    --harness "$HARNESS" \
     --verbose \
     "${EXTRA_ARGS[@]}"

@@ -7,7 +7,7 @@ its figures + CSV sidecars, and returns a structured summary dict consumed by
 
 Modules:
 
-* :func:`module_difficulty` — pass@1, pass@8, turns, tokens, cost.
+* :func:`module_difficulty` — pass@1, pass@4, pass@8, turns, tokens, cost.
 * :func:`module_command_mix` — what kinds of actions the agent takes.
 * :func:`module_composition` — projection of each dataset onto our taxonomy.
 * :func:`module_diversity` — shared-axis TF-IDF clustering.
@@ -57,6 +57,7 @@ from rl_data.comparison.core import (
     nanmean,
     nanmedian,
     save_fig_with_data,
+    summary_basename,
     write_csv,
 )
 from rl_data.comparison.styles import (
@@ -75,8 +76,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _pass_at_k(record: Dict[str, Any], k: int) -> Optional[float]:
+    """Look up pass@K for a record, falling back gracefully when K is absent.
+
+    ``analyze._load_summary`` materialises only ``pass@1`` as a top-level
+    record key; every other K lives in the dense ``pass_at_k_full`` map. The
+    historical comparison code did ``r.get("pass@8")`` which silently
+    returned ``None`` for every record — this helper is the harness-aware
+    replacement.
+    """
+    if k == 1:
+        v = record.get("pass@1")
+        if v is not None:
+            return v
+    pak = record.get("pass_at_k_full") or {}
+    val = pak.get(k)
+    return float(val) if val is not None else None
+
+
 def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
-    """pass@1 / pass@8 / turns / tokens headline + pass@k overlay + turn CDF."""
+    """pass@1 / pass@4 / pass@8 / turns / tokens headline + pass@k overlay + turn CDF."""
     summary_per_spec: Dict[str, Dict[str, Any]] = {}
     solved_per_spec: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -86,8 +105,9 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
         summary_per_spec[spec.name] = {
             "n_tasks": len(ctx.records_of(spec)),
             "n_with_solutions": len(solved),
-            "mean_pass_at_1": nanmean([r.get("pass@1") for r in solved]),
-            "mean_pass_at_8": nanmean([r.get("pass@8") for r in solved]),
+            "mean_pass_at_1": nanmean([_pass_at_k(r, 1) for r in solved]),
+            "mean_pass_at_4": nanmean([_pass_at_k(r, 4) for r in solved]),
+            "mean_pass_at_8": nanmean([_pass_at_k(r, 8) for r in solved]),
             "mean_turns": nanmean([r.get("avg_turns") for r in solved]),
             "median_turns": nanmedian([r.get("avg_turns") for r in solved]),
             "mean_tokens_per_run": nanmean([r.get("avg_tokens_est") for r in solved]),
@@ -107,6 +127,7 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
     # ---- MAIN: headline grouped bar -------------------------------------
     metrics = [
         ("pass@1", "mean_pass_at_1"),
+        ("pass@4", "mean_pass_at_4"),
         ("pass@8", "mean_pass_at_8"),
         ("avg turns", "mean_turns"),
         ("avg tok/run (k)", "mean_tokens_per_run"),
@@ -118,6 +139,7 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
         s = summary_per_spec[spec.name]
         vals = [
             s["mean_pass_at_1"],
+            s["mean_pass_at_4"],
             s["mean_pass_at_8"],
             s["mean_turns"],
             s["mean_tokens_per_run"] / 1000.0,
@@ -138,10 +160,16 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
     )
 
     # ---- APPENDIX: pass@k overlay ---------------------------------------
+    # The on-disk filename is harness-dependent: bash runs write
+    # ``<MODEL>_summary.json``, vanillux writes ``<MODEL>_vanillux_summary.json``.
+    # Resolve once via ctx.summary_basename so this stays in sync with the
+    # naming convention defined in rl_data.generate_solutions.
+    _summary_name = ctx.summary_basename
+
     def _pass_curve(recs: List[Dict[str, Any]]) -> Optional[Dict[int, float]]:
         agg: Dict[int, List[float]] = defaultdict(list)
         for r in recs:
-            p = Path(r["dir"]) / "solutions" / f"{ctx.model_slug}_summary.json"
+            p = Path(r["dir"]) / "solutions" / _summary_name
             if not p.exists():
                 continue
             try:
@@ -211,20 +239,24 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
         )
 
     # ---- Stats vs reference --------------------------------------------
+    # Note: pass@K for K>1 is *not* materialised as a top-level record key by
+    # analyze._load_summary — only ``pass@1`` is. The pre-0515 code wrote
+    # ``r["pass@8"]`` directly and silently always got None back, so the old
+    # report's pass@8 Mann-Whitney p-values were a bug, not data. Use the
+    # _pass_at_k helper which falls back to pass_at_k_full[k] for K>1.
     ref = ctx.reference
     ref_solved = solved_per_spec[ref.name]
     p_values: Dict[str, Dict[str, Optional[float]]] = {}
+
+    def _pass_vals(recs: List[Dict[str, Any]], k: int) -> List[float]:
+        return [_pass_at_k(r, k) for r in recs if _pass_at_k(r, k) is not None]
+
     for spec in ctx.baselines:
         base_solved = solved_per_spec[spec.name]
         p_values[spec.name] = {
-            "pass@1": mann_whitney(
-                [r["pass@1"] for r in ref_solved if r.get("pass@1") is not None],
-                [r["pass@1"] for r in base_solved if r.get("pass@1") is not None],
-            ),
-            "pass@8": mann_whitney(
-                [r["pass@8"] for r in ref_solved if r.get("pass@8") is not None],
-                [r["pass@8"] for r in base_solved if r.get("pass@8") is not None],
-            ),
+            "pass@1": mann_whitney(_pass_vals(ref_solved, 1), _pass_vals(base_solved, 1)),
+            "pass@4": mann_whitney(_pass_vals(ref_solved, 4), _pass_vals(base_solved, 4)),
+            "pass@8": mann_whitney(_pass_vals(ref_solved, 8), _pass_vals(base_solved, 8)),
             "avg_turns": mann_whitney(
                 [r["avg_turns"] for r in ref_solved if r.get("avg_turns") is not None],
                 [r["avg_turns"] for r in base_solved if r.get("avg_turns") is not None],
@@ -257,8 +289,18 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _load_trace_features(task_dir: Path, model_slug: str) -> Optional[Dict[str, Any]]:
-    summary = task_dir / "solutions" / f"{model_slug}_summary.json"
+def _load_trace_features(
+    task_dir: Path,
+    model_slug: str,
+    harness: str = "bash",
+) -> Optional[Dict[str, Any]]:
+    """Distil command-mix features from a single task's per-model summary.
+
+    ``harness`` selects between ``<MODEL>_summary.json`` (bash) and
+    ``<MODEL>_vanillux_summary.json`` (vanillux); see
+    :func:`rl_data.comparison.core.summary_basename`.
+    """
+    summary = task_dir / "solutions" / summary_basename(model_slug, harness)
     commands = list(iter_bash_commands(summary))
     if not commands:
         return None
@@ -283,7 +325,7 @@ def module_command_mix(ctx: RunContext) -> Dict[str, Any]:
     for spec in ctx.specs:
         fs = []
         for r in ctx.records_of(spec):
-            f = _load_trace_features(Path(r["dir"]), ctx.model_slug)
+            f = _load_trace_features(Path(r["dir"]), ctx.model_slug, ctx.harness)
             if f:
                 fs.append(f)
         feats_per_spec[spec.name] = fs
