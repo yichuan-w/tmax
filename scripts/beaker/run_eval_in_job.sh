@@ -89,6 +89,7 @@ default_sysctls = []
 cgroup_manager = "cgroupfs"
 events_logger="file"
 runtime="crun"
+compose_warning_logs=false
 CONF
 
 # Ensure root has a subuid/subgid range big enough for the userns size above.
