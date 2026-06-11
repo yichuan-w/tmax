@@ -6,8 +6,12 @@ against terminal-task baselines — currently
 [`open-thoughts/OpenThoughts-Agent-v1-RL`](https://huggingface.co/datasets/open-thoughts/OpenThoughts-Agent-v1-RL),
 [`ucsb-mlsec/terminal-bench-env`](https://github.com/ucsb-mlsec/terminal-bench-env)
 (the TermiGen / Harbor 2.0 task bank, ~3.5k tasks),
-and [`m-a-p/TerminalTraj-5k-instances`](https://huggingface.co/datasets/m-a-p/TerminalTraj-5k-instances)
-(the TerminalTraj 5k-instance release, TerminalBench 1.0 layout, 5,660 tasks).
+[`m-a-p/TerminalTraj-5k-instances`](https://huggingface.co/datasets/m-a-p/TerminalTraj-5k-instances)
+(the TerminalTraj 5k-instance release, TerminalBench 1.0 layout, 5,660 tasks),
+[`hamishivi/agent-task-cli-gym`](https://huggingface.co/datasets/hamishivi/agent-task-cli-gym)
+(CLI-Gym, SWE-Smith environment-inversion repair tasks, 1,552 → ~1,452 verifiable),
+and [`hamishivi/agent-task-swe-smith`](https://huggingface.co/datasets/hamishivi/agent-task-swe-smith)
+(SWE-smith, SWE-bench-style synthetic bug-repair tasks, ~59k).
 
 ## TL;DR
 
@@ -42,6 +46,9 @@ rl_data/comparison/
     openthoughts_agent_rl.py  # open-thoughts/OpenThoughts-Agent-v1-RL (HF, parquet tarballs)
     termigen.py               # ucsb-mlsec/terminal-bench-env (GitHub, Harbor 2.0)
     terminaltraj.py           # m-a-p/TerminalTraj-5k-instances (HF, tarball, TB 1.0)
+    r2e_gym.py                # hamishivi/agent-task-r2e-gym (HF, tarball, per-task image)
+    cli_gym.py                # hamishivi/agent-task-cli-gym (HF parquet + LiberCoders verifier join)
+    swe_smith.py              # hamishivi/agent-task-swe-smith (HF parquet + SWE-bench/SWE-smith bug+verifier join)
 ```
 
 ### Shell launchers — `rl_data/scripts/comparison/`
@@ -52,11 +59,17 @@ comparison/
   run_ingest_openthoughts.sh
   run_ingest_termigen.sh
   run_ingest_terminaltraj.sh
+  run_ingest_r2e_gym.sh
+  run_ingest_cli_gym.sh
+  run_ingest_swe_smith.sh
   run_classify_taxonomy.sh
   run_generate_solutions_et.sh
   run_generate_solutions_openthoughts.sh
   run_generate_solutions_termigen.sh
   run_generate_solutions_terminaltraj.sh
+  run_generate_solutions_r2e_gym.sh
+  run_generate_solutions_cli_gym.sh
+  run_generate_solutions_swe_smith.sh
   run_comparison.sh           # top-level orchestrator
   COMPARISON.md               # this file
 ```
@@ -129,6 +142,67 @@ analysis side.
   placeholder constants (`mathematics`/`easy`/`["mathematics"]`) across
   all 5,660 tasks, so domain/skill-type buckets rely entirely on the LLM
   classifier output.
+- **CLI-Gym** (`hamishivi/agent-task-cli-gym`, 1,552 tasks → ~1,452
+  ingested): SWE-Smith *environment-inversion* repair tasks. Each base is a
+  real Python repo (faker/pandas/scrapy/…) installed at `/testbed` inside a
+  conda env named `testbed`; the published image has had its **environment**
+  deliberately corrupted (e.g. swapped glibc locale `language`/`territory`
+  fields, poisoned codec registry, truncated shared lib) so a chosen subset
+  of unit tests fails, and the agent must restore it. The verifier is **not**
+  in the hamishivi parquet (its `dataset=passthrough` / `swerl_vanillux_sandbox`
+  env defers reward to the environment), so the adapter loads two HF datasets
+  and joins on `task_id`: images + prompts (the instruction, which is
+  byte-identical to the upstream task.yaml) from `hamishivi/agent-task-cli-gym`,
+  and the per-task run-tests.sh (the selected fail-to-pass + pass-to-pass unit
+  tests) from the upstream release
+  [`LiberCoders/CLI-Gym`](https://huggingface.co/datasets/LiberCoders/CLI-Gym).
+  (We read the instruction from the hamishivi prompt rather than the task.yaml
+  because ~6 % of upstream task.yaml files have a malformed `instruction: |`
+  block scalar; the prompt text is equivalent and always well-formed.)
+  Like R2E Gym / TerminalTraj, every task `FROM`s its own pre-built
+  `hamishi740/agent-task-cli-gym:<hash>` image (~900 MB, all distinct, public
+  on Docker Hub), so no shared base SIF; the solve script pre-builds each with
+  `--ignore-fakeroot-command`. `test_final_state.py` activates the `testbed`
+  conda env and runs `pytest <selected UTs>`, passing iff **all** selected
+  tests pass (= SWE-bench `ResolvedStatus.FULL`); the agent's environment fixes
+  survive into the verifier because the harness holds one `--writable-tmpfs`
+  instance across the rollout and the final test. Because the harness's outer
+  `pytest pytest_final_state.py` runs from the **base** conda PATH (which ships
+  no pytest), the adapter's `%post` installs/exposes a pytest there purely so
+  the wrapper can be collected — the real run happens in `testbed`. ~6 % of
+  CLI-Gym tasks select no explicit tests (whole-suite run); those are skipped
+  as unverifiable. Native domain/difficulty metadata is absent, so taxonomy
+  buckets rely entirely on the LLM classifier output.
+- **SWE-smith** (`hamishivi/agent-task-swe-smith`, ~59k tasks): SWE-bench-style
+  *synthetic bug-repair* tasks. Each base is a real Python repo (the same
+  `jyangballin/swesmith.x86_64.<repo>.<sha>` family CLI-Gym builds on) installed
+  editable at `/testbed` inside a conda env named `testbed`. SWE-smith generates
+  thousands of synthetic bugs per repo by procedurally corrupting the **source
+  code**; the agent must repair the source so a set of broken unit tests
+  (`FAIL_TO_PASS`) passes again. The verifier is **not** in the hamishivi parquet
+  (`dataset=passthrough` / `swerl_vanillux_sandbox`), so the adapter loads two HF
+  datasets and joins on the instance slug (`task_id` == `instance_id`): images +
+  prompts (the SWE-smith problem statement) from `hamishivi/agent-task-swe-smith`,
+  and the per-instance bug patch + `FAIL_TO_PASS`/`PASS_TO_PASS` from the upstream
+  release
+  [`SWE-bench/SWE-smith`](https://huggingface.co/datasets/SWE-bench/SWE-smith).
+  **Key difference from CLI-Gym:** the `jyangballin/...` base image is *shared*
+  across every bug instance of a `<repo>.<sha>` (one image, thousands of tasks)
+  and ships the **clean** repo, so the per-instance bug is not baked in — the
+  adapter ships the dataset `patch` (which, per the SWE-smith docs, is "the diff
+  that creates the bug") into the SIF and `git apply`s it in `%post`, so
+  `FAIL_TO_PASS` starts red. A task whose bug patch fails to apply produces no
+  `container.sif` and is skipped (better than shipping a trivially-passing task);
+  tasks with an empty bug patch or empty `FAIL_TO_PASS` are dropped at ingest.
+  `test_final_state.py` activates the `testbed` conda env and runs
+  `pytest <FAIL_TO_PASS>`, passing iff all of them pass; the ~500-670 `PASS_TO_PASS`
+  no-regression tests are baked in too and additionally enforced when
+  `APPTAINERENV_SWE_SMITH_CHECK_P2P=1` (off by default to bound runtime, mirroring
+  CLI-Gym's selected-test verifier). As with CLI-Gym, the agent's source edits
+  survive into the verifier via the harness's single `--writable-tmpfs` instance,
+  and the `%post` exposes a base-conda pytest purely so the outer wrapper can be
+  collected. Native domain/difficulty metadata is absent, so taxonomy buckets
+  rely entirely on the LLM classifier output.
 
 ## Output layout (`rl_data/output/comparison/`)
 
@@ -319,9 +393,15 @@ those sub-modules no-op rather than crashing.
 ## Rough cost estimate (API flash, full-run)
 
 - Ingest: CPU-only, ~10 min for ~2500 ET tasks + ~730 OT-Agent-RL tasks +
-  ~3500 TermiGen tasks + ~5660 TerminalTraj tasks. TermiGen's first run
-  does a ~350 MB sparse clone of the GitHub repo; TerminalTraj's first
-  run pulls a single 13 MB tarball from HF.
+  ~3500 TermiGen tasks + ~5660 TerminalTraj tasks + ~1450 CLI-Gym tasks.
+  TermiGen's first run does a ~350 MB sparse clone of the GitHub repo;
+  TerminalTraj's first run pulls a single 13 MB tarball from HF; CLI-Gym
+  pulls two small parquet datasets (hamishivi + LiberCoders) via
+  `datasets.load_dataset` and joins them in memory (no image pulls at
+  ingest — those happen in the solve pre-build). SWE-smith similarly joins
+  two parquet datasets in memory, but the verifier source
+  (`SWE-bench/SWE-smith`) is ~4 GB (11 shards, ~52k bug patches), so the
+  first ingest is download-bound (~5-15 min on a fast link, cached after).
 - Taxonomy classifier: ~$5-8 total (~12k × one flash call each).
 - Solves (NUM_SOLUTIONS=1, ~30k tokens/task): ~$30-60 for ET, <$5 for
   OT-Agent-RL, ~$40-80 for TermiGen, ~$5-10 for TerminalTraj at default
@@ -329,6 +409,12 @@ those sub-modules no-op rather than crashing.
   scales linearly with `NUM_SOLUTIONS`.
 - **TerminalTraj disk budget**: each per-task SIF is ~500 MB, so 500
   tasks ≈ 250 GB, 5660 ≈ 2.8 TB. Bound via `SAMPLE_SIZE`.
+- **CLI-Gym disk budget**: each per-task SIF is ~900 MB, so 250 tasks
+  ≈ 225 GB, ~1,452 ≈ 1.3 TB. Bound via `SAMPLE_SIZE` (default 250).
+- **SWE-smith disk budget**: each per-task SIF is ~900 MB, so 250 tasks
+  ≈ 225 GB. Bound via `SAMPLE_SIZE` (default 250). Many sampled tasks share
+  a `<repo>.<sha>` base layer, so apptainer's layer cache reduces the
+  effective pull volume below the naive per-SIF figure.
 - Comparison post-processing: <10 min CPU on 10k + ~12k tasks.
 
 Using `SAMPLE_SIZE=250` cuts any solve to ~10% of the above. Using a

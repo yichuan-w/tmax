@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from collections import Counter, defaultdict
+from math import comb
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -292,6 +294,83 @@ def _peak_context_words(
     }
 
 
+# ── Optional infra-error exclusion ─────────────────────────────────────────
+# When COMPARISON_EXCLUDE_INFRA=1, individual rollout runs whose verifier never
+# produced a fair pass/fail verdict (harness/infra failures, NOT genuine model
+# failures) are dropped before pass@k is recomputed. A task left with zero valid
+# runs is treated as "no solution" (dropped from the comparison entirely) rather
+# than counted as a 0. The signatures below are deliberately HIGH-PRECISION so
+# the filter is safe to apply across every dataset: a genuine test failure always
+# carries a pytest "N passed/failed" verdict and is never flagged.
+_EXCLUDE_INFRA = os.environ.get("COMPARISON_EXCLUDE_INFRA", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Substrings that unambiguously indicate a harness/verifier-side failure (the
+# verifier could not run), independent of anything the agent did.
+_INFRA_MARKERS = (
+    "Fatal Python error",            # interpreter could not boot at all
+    "INTERNALERROR",                 # pytest crashed internally
+    "cannot contain null bytes",     # corrupted site/.pth bootstrap
+)
+
+
+def _run_is_infra(result: Dict[str, Any]) -> bool:
+    """True if a single rollout run failed for harness/infra reasons rather
+    than a genuine (verifier-confirmed) model failure.
+
+    Conservative by design: success always counts as valid, and any run that
+    carries a real pytest verdict (``N passed`` / ``N failed`` / ``N error``)
+    counts as valid even if it also prints a traceback.
+    """
+    if result.get("success"):
+        return False
+    out = (result.get("output") or "").strip()
+    if not out:
+        # No verifier signal at all — the verifier produced nothing.
+        return True
+    # PRECEDENCE: a real pytest verdict ("N passed" / "N failed") means the
+    # verifier actually ran and judged the agent's work — that is a GENUINE
+    # model result, even if the body also contains a FileNotFoundError (the
+    # agent's own missing output) or a traceback inside an assertion message.
+    # Only runs that never reached a verdict can be infra.
+    if re.search(r"\b\d+ (passed|failed)\b", out):
+        return False
+    # No verdict reached → the verifier never produced a result. Flag the
+    # harness/bootstrap failure signatures we recognise.
+    if "No such file or directory" in out and (
+        "pytest_final_state" in out or "test_final_state" in out or "agent_env" in out
+    ):
+        return True
+    if any(m in out for m in _INFRA_MARKERS):
+        return True
+    # A bare interpreter/verifier-bootstrap traceback with no verdict means the
+    # test session never ran (e.g. the agent left the conda/toolchain corrupted
+    # so pytest itself can't import).
+    if "Traceback (most recent call last)" in out:
+        return True
+    return False
+
+
+def _apply_infra_filter(sol: Dict[str, Any]) -> None:
+    """In-place: drop infra runs from *sol* and recompute num_runs/num_success/
+    pass_at_k over the remaining valid runs (unbiased estimator, matching
+    rl_data.generator.vanillux_solver)."""
+    results = sol.get("results", [])
+    valid = [r for r in results if not _run_is_infra(r)]
+    if len(valid) == len(results):
+        return  # nothing infra — leave the summary untouched
+    n = len(valid)
+    c = sum(1 for r in valid if r.get("success"))
+    sol["results"] = valid
+    sol["num_runs"] = n
+    sol["num_success"] = c
+    pak: Dict[int, float] = {}
+    for k in range(1, n + 1):
+        pak[k] = 0.0 if c == 0 else float(1.0 - (comb(n - c, k) / comb(n, k)))
+    sol["pass_at_k"] = pak
+
+
 def _load_summary(summary_path: Path, record: Dict[str, Any]) -> None:
     """Populate *record* with metrics from a model summary file.
 
@@ -301,6 +380,8 @@ def _load_summary(summary_path: Path, record: Dict[str, Any]) -> None:
     """
     with open(summary_path) as f:
         sol = json.load(f)
+    if _EXCLUDE_INFRA:
+        _apply_infra_filter(sol)
     record["num_runs"] = sol.get("num_runs", 0)
     record["num_success"] = sol.get("num_success", 0)
     raw_pak = sol.get("pass_at_k", {})
@@ -431,7 +512,10 @@ def _load_summary(summary_path: Path, record: Dict[str, Any]) -> None:
         record["avg_peak_input_tokens"] = 0.0
         record["avg_final_output_tokens"] = 0.0
 
-    record["has_solutions"] = True
+    # With the infra filter on, a task whose every run was an infra failure has
+    # no valid runs left (n == 0); drop it from the comparison rather than
+    # scoring it as a 0 (the model was never fairly evaluated).
+    record["has_solutions"] = n > 0
 
 
 def _summary_basename(model_slug: str, harness: str) -> str:

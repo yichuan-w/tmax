@@ -6,7 +6,9 @@
 #                         scripts/run_ingest_openthoughts.sh,
 #                         scripts/run_ingest_termigen.sh,
 #                         scripts/run_ingest_terminaltraj.sh,
-#                         scripts/run_ingest_r2e_gym.sh)
+#                         scripts/run_ingest_r2e_gym.sh,
+#                         scripts/run_ingest_cli_gym.sh,
+#                         scripts/run_ingest_swe_smith.sh)
 #   2. Classify external tasks into OUR taxonomy via an LLM
 #      (scripts/run_classify_taxonomy.sh)
 #   3. Run our solution harness on each baseline + our rebased reference
@@ -29,15 +31,27 @@
 #   TG_TASKS_DIR           Default: rl_data/output/tasks_termigen
 #   TT_TASKS_DIR           Default: rl_data/output/tasks_terminaltraj
 #   R2E_TASKS_DIR          Default: rl_data/output/tasks_r2e_gym
+#   CLI_GYM_TASKS_DIR      Default: rl_data/output/tasks_cli_gym
+#   SWE_SMITH_TASKS_DIR    Default: rl_data/output/tasks_swe_smith
 #   COMPARE_OUT_DIR        Default: rl_data/output/comparison_vanillux_0515
 #   MODEL                  Default: gemini/gemini-3-flash-preview
 #   HARNESS                Default: vanillux  (set to 'bash' to read legacy
 #                          <MODEL>_summary.json files from a pre-0515 run)
+#   COMPARISON_EXCLUDE_INFRA=1  Drop harness/verifier-side infra failures (e.g.
+#                          the `pytest_final_state.py`-not-found staging bug, a
+#                          broken pytest/attrs plugin, a corrupted interpreter)
+#                          from each task before recomputing pass@k over the
+#                          remaining valid runs. Tasks left with zero valid runs
+#                          are dropped from the comparison entirely. High-
+#                          precision: genuine test failures (any pytest verdict)
+#                          are never excluded. Materially affects only CLI-Gym
+#                          (~6.5% of runs) and TerminalTraj (~10%); other
+#                          baselines see <=0.3%.
 #
 # Stage skips:
-#   SKIP_INGEST_ET=1, SKIP_INGEST_OT=1, SKIP_INGEST_TG=1, SKIP_INGEST_TT=1, SKIP_INGEST_R2E=1
+#   SKIP_INGEST_ET=1, SKIP_INGEST_OT=1, SKIP_INGEST_TG=1, SKIP_INGEST_TT=1, SKIP_INGEST_R2E=1, SKIP_INGEST_CLI_GYM=1, SKIP_INGEST_SWE_SMITH=1
 #   SKIP_CLASSIFY=1
-#   SKIP_SOLVE_OURS=1, SKIP_SOLVE_ET=1, SKIP_SOLVE_OT=1, SKIP_SOLVE_TG=1, SKIP_SOLVE_TT=1, SKIP_SOLVE_R2E=1
+#   SKIP_SOLVE_OURS=1, SKIP_SOLVE_ET=1, SKIP_SOLVE_OT=1, SKIP_SOLVE_TG=1, SKIP_SOLVE_TT=1, SKIP_SOLVE_R2E=1, SKIP_SOLVE_CLI_GYM=1, SKIP_SOLVE_SWE_SMITH=1
 #   SKIP_COMPARE=1
 
 set -euo pipefail
@@ -51,6 +65,12 @@ TT_TASKS_DIR="${TT_TASKS_DIR:-rl_data/output/tasks_terminaltraj}"
 # HF dataset was rebuilt mid-flight and the re-solve hasn't completed. Re-enable
 # by passing ``R2E_TASKS_DIR=rl_data/output/tasks_r2e_gym``.
 R2E_TASKS_DIR="${R2E_TASKS_DIR-}"
+# CLI-Gym (hamishivi/agent-task-cli-gym) — SWE-Smith environment-inversion
+# repair tasks. On by default once ingested.
+CLI_GYM_TASKS_DIR="${CLI_GYM_TASKS_DIR:-rl_data/output/tasks_cli_gym}"
+# SWE-smith (hamishivi/agent-task-swe-smith) — synthetic bug-repair tasks
+# (SWE-bench-style). On by default once ingested.
+SWE_SMITH_TASKS_DIR="${SWE_SMITH_TASKS_DIR:-rl_data/output/tasks_swe_smith}"
 COMPARE_OUT_DIR="${COMPARE_OUT_DIR:-rl_data/output/comparison_vanillux_0515}"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
 HARNESS="${HARNESS:-vanillux}"
@@ -66,6 +86,8 @@ echo "  OT           : $OT_TASKS_DIR"
 echo "  TermiGen     : $TG_TASKS_DIR"
 echo "  TerminalTraj : $TT_TASKS_DIR"
 echo "  R2E Gym      : $R2E_TASKS_DIR"
+echo "  CLI-Gym      : $CLI_GYM_TASKS_DIR"
+echo "  SWE-smith    : $SWE_SMITH_TASKS_DIR"
 echo "  model        : $MODEL"
 echo "  harness      : $HARNESS"
 echo "  out-dir      : $COMPARE_OUT_DIR"
@@ -92,11 +114,19 @@ echo
 #   echo ">>> 1e. Ingesting R2E Gym (hamishivi/agent-task-r2e-gym)"
 #   R2E_DST="$R2E_TASKS_DIR" bash "$SCRIPT_DIR/run_ingest_r2e_gym.sh"
 # fi
+# if [[ "${SKIP_INGEST_CLI_GYM:-0}" != "1" ]]; then
+#   echo ">>> 1f. Ingesting CLI-Gym (hamishivi/agent-task-cli-gym)"
+#   CLI_GYM_DST="$CLI_GYM_TASKS_DIR" bash "$SCRIPT_DIR/run_ingest_cli_gym.sh"
+# fi
+# if [[ "${SKIP_INGEST_SWE_SMITH:-0}" != "1" ]]; then
+#   echo ">>> 1g. Ingesting SWE-smith (hamishivi/agent-task-swe-smith)"
+#   SWE_SMITH_DST="$SWE_SMITH_TASKS_DIR" bash "$SCRIPT_DIR/run_ingest_swe_smith.sh"
+# fi
 
 # # ── 2. Classify into our taxonomy ──────────────────────────────────────
 # if [[ "${SKIP_CLASSIFY:-0}" != "1" ]]; then
 #   echo ">>> 2. Classifying external tasks into our taxonomy"
-#   CLASSIFY_DIRS="$ET_TASKS_DIR $OT_TASKS_DIR $TG_TASKS_DIR $TT_TASKS_DIR $R2E_TASKS_DIR" \
+#   CLASSIFY_DIRS="$ET_TASKS_DIR $OT_TASKS_DIR $TG_TASKS_DIR $TT_TASKS_DIR $R2E_TASKS_DIR $CLI_GYM_TASKS_DIR $SWE_SMITH_TASKS_DIR" \
 #       CLASSIFY_MODEL="$MODEL" \
 #       bash "$SCRIPT_DIR/run_classify_taxonomy.sh"
 # fi
@@ -134,6 +164,14 @@ echo
 #   echo ">>> 3f. Solving R2E Gym (prefer Slurm for the real run)"
 #   bash "$SCRIPT_DIR/run_generate_solutions_r2e_gym.sh"
 # fi
+# if [[ "${SKIP_SOLVE_CLI_GYM:-0}" != "1" ]]; then
+#   echo ">>> 3g. Solving CLI-Gym (prefer Slurm for the real run)"
+#   bash "$SCRIPT_DIR/run_generate_solutions_cli_gym.sh"
+# fi
+# if [[ "${SKIP_SOLVE_SWE_SMITH:-0}" != "1" ]]; then
+#   echo ">>> 3h. Solving SWE-smith (prefer Slurm for the real run)"
+#   bash "$SCRIPT_DIR/run_generate_solutions_swe_smith.sh"
+# fi
 
 # ── 4. Compare ─────────────────────────────────────────────────────────
 if [[ "${SKIP_COMPARE:-0}" != "1" ]]; then
@@ -153,6 +191,12 @@ if [[ "${SKIP_COMPARE:-0}" != "1" ]]; then
   fi
   if [[ -n "$R2E_TASKS_DIR" && -d "$R2E_TASKS_DIR" ]]; then
     BASELINE_ARGS+=(--baseline "r2e_gym:$R2E_TASKS_DIR")
+  fi
+  if [[ -n "$CLI_GYM_TASKS_DIR" && -d "$CLI_GYM_TASKS_DIR" ]]; then
+    BASELINE_ARGS+=(--baseline "cli_gym:$CLI_GYM_TASKS_DIR")
+  fi
+  if [[ -n "$SWE_SMITH_TASKS_DIR" && -d "$SWE_SMITH_TASKS_DIR" ]]; then
+    BASELINE_ARGS+=(--baseline "swe_smith:$SWE_SMITH_TASKS_DIR")
   fi
 
   uv run python -m rl_data.comparison.cli \

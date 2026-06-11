@@ -434,4 +434,6 @@ from rl_data.comparison.adapters import (  # noqa: E402, F401
     termigen,
     terminaltraj,
     r2e_gym,
+    cli_gym,
+    swe_smith,
 )

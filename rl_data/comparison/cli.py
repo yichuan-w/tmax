@@ -70,13 +70,15 @@ ALL_MODULES = {
 # stay unchanged so existing artefacts (task dirs, summary files, CSVs that key
 # off ``dataset`` columns) keep working without a migration.
 _DISPLAY_NAMES = {
-    "skill_tax": "TMaxx (ours)",
+    "skill_tax": "TMax (ours)",
     "endless_terminals": "Endless-Terminals",
     "openthoughts_tb": "OpenThoughts-TB",
     "openthoughts_agent_rl": "OpenThoughts-Agent",
     "termigen": "TermiGen",
     "terminaltraj": "TerminalTraj",
     "r2e_gym": "R2E-Gym",
+    "cli_gym": "CLI-Gym",
+    "swe_smith": "SWE-smith",
 }
 
 

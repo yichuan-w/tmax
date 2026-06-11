@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=rl-gen-sol-r2e
-#SBATCH --output=logs/gen_sol_r2e_%j.out
-#SBATCH --error=logs/gen_sol_r2e_%j.err
+#SBATCH --job-name=rl-gen-sol-swesmith
+#SBATCH --output=logs/gen_sol_swesmith_%j.out
+#SBATCH --error=logs/gen_sol_swesmith_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
@@ -9,44 +9,47 @@
 #SBATCH --mem=880G
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
-# ║  Run our solution-generation harness on the (converted) R2E Gym       ║
-# ║  (hamishivi/agent-task-r2e-gym) dataset under the VANILLUX harness,   ║
-# ║  using the uniform comparison config (NUM_SOLUTIONS=8, MAX_ACTIONS=64,║
-# ║  COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed SAMPLE_SEED=0).          ║
+# ║  Run our solution-generation harness on the (converted) SWE-smith      ║
+# ║  (hamishivi/agent-task-swe-smith) dataset under the VANILLUX harness,  ║
+# ║  using the uniform comparison config (NUM_SOLUTIONS=8, MAX_ACTIONS=64, ║
+# ║  COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed SAMPLE_SEED=0).           ║
 # ║                                                                        ║
 # ║  Output: per-task                                                      ║
 # ║    <task>/solutions/<MODEL_TAG>_vanillux_summary.json                  ║
 # ║                                                                        ║
-# ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_r2e_gym.sh   ║
-# ║  once to extract 8,101 tasks into TASKS_DIR (downloads + extracts the ║
-# ║  14 MB task-data.tar.gz).                                              ║
+# ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_swe_smith.sh  ║
+# ║  once to materialize the tasks into TASKS_DIR (joins hamishivi's       ║
+# ║  shared base images with SWE-bench/SWE-smith's per-instance bug patch  ║
+# ║  + FAIL_TO_PASS verifier).                                            ║
 # ║                                                                        ║
-# ║  WRINKLES SPECIFIC TO R2E GYM:                                        ║
+# ║  WRINKLES SPECIFIC TO SWE-SMITH:                                       ║
 # ║                                                                        ║
-# ║  1. Every task has a UNIQUE Docker Hub image                           ║
-# ║     (namanjain12/<repo>_final:<commit>) -- 8,101 distinct images,    ║
-# ║     ~400-800 MB compressed each. We cannot prebuild a shared base    ║
-# ║     SIF; each per-task SIF starts from its own FROM layer.           ║
+# ║  1. Tasks share a base Docker Hub image per <repo>.<sha>               ║
+# ║     (jyangballin/swesmith.x86_64.<repo>.<sha>, public on Docker Hub).  ║
+# ║     Each per-task SIF FROMs that base and differs only by the          ║
+# ║     build-time-injected bug layer; apptainer's layer cache amortizes   ║
+# ║     the shared base across same-repo tasks.                            ║
 # ║                                                                        ║
-# ║  2. R2E images bake the repo at the buggy commit at /testbed, with   ║
-# ║     a project-local virtualenv at /testbed/.venv. The instruction    ║
-# ║     itself tells the agent to ``cd /testbed && source .venv/bin/     ║
-# ║     activate``; the harness lands the agent in /home/user (writable  ║
-# ║     tmpfs) per the standard convention, and the agent navigates.     ║
+# ║  2. The bug is INJECTED AT BUILD TIME. The dataset `patch` is the diff ║
+# ║     that creates the bug; the container.def %post `git apply`s it to   ║
+# ║     the clean /testbed so FAIL_TO_PASS starts red. A task whose bug    ║
+# ║     patch fails to apply produces no container.sif and is skipped.     ║
 # ║                                                                        ║
-# ║  3. The adapter has already injected a robust pytest-bootstrap       ║
-# ║     %post (the same one TerminalTraj uses) so the SIFs ship with a   ║
-# ║     pytest on global PATH -- the harness's `pytest pytest_final_    ║
-# ║     state.py` invocation runs OUTSIDE /testbed/.venv and needs that. ║
+# ║  3. The repo lives at /testbed (editable install) in a conda env named ║
+# ║     `testbed` (/opt/miniconda3/envs/testbed). The verifier             ║
+# ║     (test_final_state.py) runs FAIL_TO_PASS inside that env; the       ║
+# ║     harness's outer `pytest pytest_final_state.py` runs from the       ║
+# ║     base-conda PATH, so the adapter's %post installs a pytest into     ║
+# ║     base conda purely so the wrapper can be collected (it re-activates ║
+# ║     `testbed` itself). Set APPTAINERENV_SWE_SMITH_CHECK_P2P=1 to also  ║
+# ║     enforce the PASS_TO_PASS no-regression set (slower).               ║
 # ║                                                                        ║
-# ║  4. Some R2E base images may have old glibc incompatible with        ║
-# ║     Apptainer's bundled fakeroot. We pre-build with                  ║
-# ║     --ignore-fakeroot-command (as TerminalTraj does); the harness's  ║
-# ║     own build step then short-circuits because the SIF already       ║
-# ║     exists.                                                            ║
+# ║  4. Some base images may ship a fakeroot binary whose glibc is         ║
+# ║     incompatible with Apptainer's. We pre-build per-task SIFs HERE     ║
+# ║     with --ignore-fakeroot-command (as R2E Gym / CLI-Gym do); the      ║
+# ║     harness's own build then short-circuits on the existing SIF.       ║
 # ║                                                                        ║
-# ║  5. DISK: 8,101 SIFs × ~600 MB ≈ 4.9 TB. SAMPLE_SIZE=250 (uniform    ║
-# ║     comparison default) caps this to ~150 GB.                         ║
+# ║  5. DISK: ~900 MB/SIF. SAMPLE_SIZE=250 caps this to ~225 GB.           ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -66,7 +69,7 @@ fi
 export GEMINI_API_KEY
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_r2e_gym"
+TASKS_DIR="rl_data/output/tasks_swe_smith"
 # Override via env. Examples:
 #   API model:   MODEL="gemini/gemini-3-flash-preview"
 #   Local vLLM:  MODEL="hosted_vllm/Qwen/Qwen2.5-Coder-7B-Instruct" \
@@ -85,8 +88,9 @@ MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-# 600s matches the vanillux reference: R2E tasks involve a real pytest suite
-# over a real repo (sympy/pandas/...), which can be heavy under parallelism.
+# 600s matches the vanillux reference: SWE-smith tasks run a real pytest suite
+# over a real repo (pandas/sympy/scrapy/...), which can be heavy under
+# parallelism (pandas test files in particular).
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-600}"
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
@@ -97,8 +101,8 @@ LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
 # Cost-bounded subsample: 250 tasks (uniform across all baselines). Fixed
-# seed=0 so the same 250 R2E tasks are picked on every rerun. Disk budget:
-# 250 × ~600 MB SIFs ≈ 150 GB.
+# seed=0 so the same 250 SWE-smith tasks are picked on every rerun. Disk
+# budget: 250 × ~900 MB SIFs ≈ 225 GB.
 SAMPLE_SIZE="${SAMPLE_SIZE:-250}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
@@ -108,7 +112,7 @@ WORKERS="${WORKERS:-12}"
 NUM_POOL_WORKERS="${NUM_POOL_WORKERS:-16}"
 
 # Pre-build phase: how many SIFs to build in parallel. Each build pulls a
-# ~600 MB Docker image, so mostly I/O-bound. 4-8 workers is the sweet spot;
+# ~900 MB Docker image, so mostly I/O-bound. 4-8 workers is the sweet spot;
 # higher values saturate the shared apptainer cache on GPFS and the link.
 PREBUILD_WORKERS="${PREBUILD_WORKERS:-8}"
 PREBUILD_RETRIES="${PREBUILD_RETRIES:-2}"
@@ -129,7 +133,7 @@ mkdir -p logs
 source "$SCRIPT_DIR/_vllm_local.sh"
 _vllm_start_local
 
-# Docker Hub creds are OPTIONAL for R2E Gym because every namanjain12 image is
+# Docker Hub creds are OPTIONAL for SWE-smith because every jyangballin image is
 # PUBLIC on Docker Hub. We still pass them through if set so anonymous pull
 # rate limits (100 pulls/6h/IP) don't bite mid-run.
 export APPTAINER_DOCKER_USERNAME="${APPTAINER_DOCKER_USERNAME:-}"
@@ -151,14 +155,13 @@ export APPTAINER_CACHEDIR="/gpfs/projects/h2lab/osey/apptainer_cache"
 export APPTAINER_TMPDIR="/tmp/apptainer_tmp"
 mkdir -p "$APPTAINER_TMPDIR"
 
-# Some R2E base images may ship a bundled /.singularity.d/libs/fakeroot
-# whose embedded glibc is incompatible with the host (mirrors the
-# TerminalTraj Fedora-27 failure mode), so solve-time
+# Some base images may ship a bundled /.singularity.d/libs/fakeroot whose
+# embedded glibc is incompatible with the host (mirrors the TerminalTraj
+# Fedora-27 / R2E failure modes), so solve-time
 # `apptainer instance start --fakeroot` and `apptainer exec --fakeroot`
 # crash. Setting this env var makes the harness add
 # --ignore-fakeroot-command to every fakeroot invocation, falling back to
-# user-namespace fakeroot emulation that we already use during the
-# prebuild phase.
+# user-namespace fakeroot emulation that we already use during the prebuild.
 export APPTAINER_IGNORE_FAKEROOT_COMMAND="${APPTAINER_IGNORE_FAKEROOT_COMMAND:-1}"
 
 # Keep apptainer instance logs off GPFS; heal dangling symlinks left behind
@@ -169,17 +172,16 @@ if [ ! -L "$HOME/.apptainer/instances" ]; then
   ln -s /tmp/apptainer_instances "$HOME/.apptainer/instances"
 fi
 
-# ---- R2E Gym pre-build phase --------------------------------------------
+# ---- SWE-smith pre-build phase ------------------------------------------
 # The harness's build_sif() in rl_data/generate_solutions.py does not pass
-# --ignore-fakeroot-command, which some R2E images (old glibc) may require.
-# We resolve this by pre-building the per-task SIFs HERE with the flag; the
-# harness's pre-build then detects the existing container.sif and skips its
-# own build step.
+# --ignore-fakeroot-command, which some images may require. We resolve this by
+# pre-building the per-task SIFs HERE with the flag; the harness's pre-build
+# then detects the existing container.sif and skips its own build step.
 #
 # Compute the list of tasks we're about to solve, matching exactly what
 # generate_solutions.py will pick (same seed + size + start/num slicing).
-echo "=== R2E Gym pre-build: computing task list ==="
-mapfile -t R2E_TASKS < <(
+echo "=== SWE-smith pre-build: computing task list ==="
+mapfile -t SWE_SMITH_TASKS < <(
   uv run python - <<PYEOF
 import random
 from pathlib import Path
@@ -192,7 +194,7 @@ num_tasks = $NUM_TASKS
 
 all_task_dirs = sorted(
     str(p) for p in tasks_dir.iterdir()
-    if p.is_dir() and p.name.startswith("r2e_")
+    if p.is_dir() and p.name.startswith("swesmith_")
 )
 if sample_size and sample_size > 0 and sample_size < len(all_task_dirs):
     rng = random.Random(sample_seed)
@@ -205,17 +207,17 @@ print("\n".join(window))
 PYEOF
 )
 
-R2E_N="${#R2E_TASKS[@]}"
-echo "=== R2E Gym: ${R2E_N} tasks selected (sample_size=${SAMPLE_SIZE}, seed=${SAMPLE_SEED}) ==="
+SWE_SMITH_N="${#SWE_SMITH_TASKS[@]}"
+echo "=== SWE-smith: ${SWE_SMITH_N} tasks selected (sample_size=${SAMPLE_SIZE}, seed=${SAMPLE_SEED}) ==="
 
-if [ "$R2E_N" = "0" ]; then
-  echo "ERROR: no R2E tasks selected -- did you run run_ingest_r2e_gym.sh first?" >&2
+if [ "$SWE_SMITH_N" = "0" ]; then
+  echo "ERROR: no SWE-smith tasks selected -- did you run run_ingest_swe_smith.sh first?" >&2
   exit 1
 fi
 
 # Build one SIF. Exits 0 on success, non-zero on failure (but never with
 # `set -e` propagation so one bad task doesn't abort the whole pre-build).
-r2e_build_one() {
+swe_smith_build_one() {
   local task_dir="$1"
   local sif="${task_dir}/container.sif"
   local def="${task_dir}/container.def"
@@ -242,25 +244,33 @@ r2e_build_one() {
   echo "  FAIL  ${tag} -- see ${task_dir}/.prebuild.log" >&2
   return 1
 }
-export -f r2e_build_one
+export -f swe_smith_build_one
 export PREBUILD_RETRIES FORCE_RERUN
 
-echo "=== R2E Gym pre-build: ${R2E_N} SIF(s), workers=${PREBUILD_WORKERS} ==="
-R2E_BUILD_LIST="$(mktemp)"
-trap 'rm -f "$R2E_BUILD_LIST"' EXIT
-printf '%s\n' "${R2E_TASKS[@]}" > "$R2E_BUILD_LIST"
+echo "=== SWE-smith pre-build: ${SWE_SMITH_N} SIF(s), workers=${PREBUILD_WORKERS} ==="
+SWE_SMITH_BUILD_LIST="$(mktemp)"
+trap 'rm -f "$SWE_SMITH_BUILD_LIST"' EXIT
+printf '%s\n' "${SWE_SMITH_TASKS[@]}" > "$SWE_SMITH_BUILD_LIST"
 
 # xargs -P parallelises; we tolerate individual failures because one bad
 # task shouldn't block the other N-1 builds. The harness will mark the
 # still-no-container.sif tasks as failed in the solution phase anyway.
-xargs -a "$R2E_BUILD_LIST" -I{} -P "$PREBUILD_WORKERS" \
-  bash -c 'r2e_build_one "$@"' _ {} || true
+#
+# Each swe_smith_build_one prints exactly ONE terminal line per task
+# (ok/skip/miss/FAIL), so piping the merged stream through `python -m tqdm`
+# gives a live progress bar with count + rate + ETA. tqdm forwards stdin to
+# stdout unchanged (per-task lines stay visible) and draws the bar on stderr;
+# in non-TTY sbatch logs it degrades to periodic newline updates.
+xargs -a "$SWE_SMITH_BUILD_LIST" -I{} -P "$PREBUILD_WORKERS" \
+  bash -c 'swe_smith_build_one "$@"' _ {} 2>&1 \
+  | uv run python -m tqdm --total "$SWE_SMITH_N" --unit sif \
+      --desc "SWE-smith prebuild" --dynamic_ncols || true
 
 _BUILT=0
-for td in "${R2E_TASKS[@]}"; do
+for td in "${SWE_SMITH_TASKS[@]}"; do
   [ -f "${td}/container.sif" ] && _BUILT=$((_BUILT + 1))
 done
-echo "=== R2E Gym pre-build done: ${_BUILT}/${R2E_N} SIFs ready ==="
+echo "=== SWE-smith pre-build done: ${_BUILT}/${SWE_SMITH_N} SIFs ready ==="
 
 # ---- Solution phase -----------------------------------------------------
 _vllm_wait_ready_local
@@ -289,7 +299,7 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== R2E Gym comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
+echo "=== SWE-smith comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
 echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \

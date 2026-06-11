@@ -237,8 +237,17 @@ def classify_tasks_dir(
     max_concurrency: int = 32,
     temperature: float = 0.0,
     limit: int = 0,
+    only_solved: bool = False,
 ) -> dict:
     """Classify every task under ``tasks_dir`` in a single batched call.
+
+    When ``only_solved`` is set, restrict to tasks that carry at least one
+    solutions summary (``solutions/*_summary.json``). This is the right scope
+    for huge baselines (e.g. SWE-smith ships ~59k task dirs but only the
+    seeded-random SAMPLE_SIZE subset is ever solved): the comparison's
+    performance metrics use only solved tasks, and that solved subset is a
+    uniform random sample, so its classified composition is an unbiased,
+    far-cheaper estimate of the full-dataset composition.
 
     Returns a stats dict: ``{total, classified, skipped, failed}``.
     """
@@ -246,6 +255,12 @@ def classify_tasks_dir(
         p for p in tasks_dir.iterdir()
         if p.is_dir() and (p.name.startswith("task_") or (p / "task.json").exists())
     )
+    if only_solved:
+        task_dirs = [
+            p for p in task_dirs
+            if (p / "solutions").is_dir()
+            and any((p / "solutions").glob("*_summary.json"))
+        ]
 
     # Skip tasks that already carry classified_* keys (unless --force).
     need: List[Path] = []
@@ -336,6 +351,10 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=0,
                     help="Classify at most N unclassified tasks (0 = all)")
+    ap.add_argument("--only-solved", action="store_true",
+                    help="Only classify tasks that have a solutions/*_summary.json "
+                         "(the subset the comparison actually scores). Essential "
+                         "for huge baselines like SWE-smith (~59k dirs, 250 solved).")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -347,6 +366,7 @@ def main() -> None:
         max_concurrency=args.max_concurrency,
         temperature=args.temperature,
         limit=args.limit,
+        only_solved=args.only_solved,
     )
     logger.info("Done. %s", stats)
 
