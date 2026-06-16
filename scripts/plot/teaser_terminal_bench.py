@@ -1,47 +1,48 @@
 """Teaser figure: Terminal-Bench 2.0 performance vs (rough) model size.
 
-The figure is the paper's opener: a scatter where the *y*-axis is TB2.0 score
-and the *x*-axis is model size — but the size axis is deliberately **not** a
-plain log scale.  We have many models bunched at 4B / 8B / 32B and then a big
-empty gap up to the 200–350B frontier models (MiniMax, GLM) and the
-closed-source models whose size is unknown (Claude, GPT-5).  A literal log
-axis wastes the middle and crushes the small-model region, so instead we use a
-*piecewise-linear-in-log* transform with hand-placed knots (see ``X_KNOTS``)
-that gives each "tier" roughly equal horizontal real-estate, and parks the
-unknown-size models at a dedicated ``?`` position on the far right.
+The figure is the paper's opener: a scatter where the *y*-axis is the TB2.0
+score and the *x*-axis is model size — but the size axis is deliberately **not**
+a plain log scale.  Models bunch up at 2-32B and again in the 100B-1T frontier,
+so a literal log axis wastes space and crushes the small-model region.  Instead
+we use a *piecewise-linear-in-log* transform with hand-placed knots (see
+``X_KNOTS``) that gives each "tier" roughly equal horizontal real-estate, parks
+the undisclosed-size closed models at a dedicated ``?`` column on the far right,
+and draws a visual **axis break** between the ``1T`` tier and ``?``.
 
-Individual data points are drawn either as a brand **logo** (PNG in
-``scripts/plot/media``) or, for research baselines, as a simple coloured dot.
-Every logo is normalised to (roughly) the same on-figure size, with a per-model
-scale knob for fine-tuning, plus a small text annotation naming the model.
+Each point is drawn with its brand **logo as the marker**, centred on the exact
+(x, y), with a vertical **error bar** (± std) through it and the model **name**
+as a nearby annotation.  Models without a logo fall back to a small coloured
+dot.  Logos are normalised to ~the same on-figure size (per-model fine-tune via
+``logo_scale``).  A shaded overlay marks the "very large / undisclosed size"
+region on the right, and an **axis break** separates the ``1T`` tier from the
+``?`` column of closed models whose size is undisclosed.
 
 Run::
 
     uv run python scripts/plot/teaser_terminal_bench.py
-    uv run python scripts/plot/teaser_terminal_bench.py --csv scripts/plot/terminal_bench_results.csv
 
-Styling intentionally mirrors ``rl_data/comparison/styles.py`` (DejaVu Serif,
-no top/right spines, light-grey axes, Anthropic-warm palette) so the teaser
-reads as part of the same figure family as the rest of the paper.
+Styling mirrors ``rl_data/comparison/styles.py`` (DejaVu Serif, no top/right
+spines, light-grey axes, Anthropic-warm palette) so the teaser reads as part of
+the same figure family as the rest of the paper.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import importlib.util
-
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 from PIL import Image
 
@@ -49,72 +50,73 @@ logger = logging.getLogger(__name__)
 
 HERE = Path(__file__).resolve().parent
 MEDIA = HERE / "media"
+DEFAULT_CSV = HERE / "terminal_bench_results.csv"
+DEFAULT_OUT = HERE / "output" / "teaser_terminal_bench"
 
 
 def _load_styles_module():
     """Load ``rl_data/comparison/styles.py`` *directly by file path*.
 
-    We deliberately avoid ``from rl_data.comparison.styles import ...`` because
-    importing it as a package runs ``rl_data/__init__.py``, which imports
-    ``litellm`` (≈4s cold).  ``styles.py`` itself only uses the stdlib, so
-    loading the file in isolation keeps it as the single source of truth for
-    the paper's palette while making this script start near-instantly.
+    We avoid ``from rl_data.comparison.styles import ...`` because importing it
+    as a package runs ``rl_data/__init__.py``, which imports ``litellm`` (≈4s
+    cold).  ``styles.py`` only uses the stdlib, so loading the file in isolation
+    keeps it the single source of truth for the palette while staying fast.
     """
     styles_path = HERE.parent.parent / "rl_data" / "comparison" / "styles.py"
     spec = importlib.util.spec_from_file_location("_tmax_paper_styles", styles_path)
     module = importlib.util.module_from_spec(spec)
-    # Register before exec so dataclasses in styles.py can resolve their own
-    # module via sys.modules[cls.__module__] during class creation.
-    sys.modules[spec.name] = module
+    sys.modules[spec.name] = module  # so dataclasses in styles.py resolve
     spec.loader.exec_module(module)
     return module
 
 
-# Reuse the paper's colour helpers so this figure matches the others.
+# Reuse the paper's colour helper so this figure matches the others.
 darken_hex = _load_styles_module().darken_hex
-DEFAULT_CSV = HERE / "terminal_bench_results.csv"
-DEFAULT_OUT = HERE / "output" / "teaser_terminal_bench"
 
 
 # ===========================================================================
 # 1. X-AXIS TRANSFORM  (the "untraditional" part)
 # ===========================================================================
 #
-# We map a model's size (in billions of params) to a horizontal plot position
-# via piecewise-linear interpolation **in log10(size)** through these knots.
-# Each consecutive knot pair is given one full unit of horizontal space, so the
-# 4B->8B, 8B->32B and 32B->(200-350B) jumps all *look* equally wide even though
-# they span very different multiplicative ranges.  Tweak these to re-balance.
+# Map a model's size (billions of params) to an x position by piecewise-linear
+# interpolation **in log10(size)** through these knots.  Each consecutive knot
+# pair gets one unit of horizontal space, so the 2->4->8->32B and 32B->...->1T
+# jumps all *look* comparably wide despite spanning very different ranges.
 #
 #                       size(B)  ->  x-position
+# NB: the 8B->32B segment is deliberately given *two* units of width (1 -> 3)
+# rather than one, because that's where most models live and the labels need
+# breathing room.  Every other segment gets one unit.
 X_KNOTS: List[Tuple[float, float]] = [
     (4.0, 0.0),
     (8.0, 1.0),
-    (32.0, 2.0),
-    (256.0, 3.0),    # representative anchor for the 200-350B "very large" tier
-    (1000.0, 4.0),   # ~1T total-param tier (e.g. MAI-Thinking, 35B active)
+    (32.0, 3.0),     # <- stretched: 8B->32B spans 2 units for extra room
+    (128.0, 4.0),
+    (1024.0, 5.0),
 ]
-# Models with no public size (Claude, GPT-5, ...) are parked here, on the right.
-UNKNOWN_X: float = 5.0
+# Closed models with no public size (Claude, GPT-5, ...) are parked here, to the
+# right of an axis break.
+UNKNOWN_X: float = 6.0
+BREAK_X: float = 5.5          # where the // axis break is drawn
 
 # Where to draw x ticks and what to call them.
 X_TICKS: List[Tuple[float, str]] = [
     (0.0, "4B"),
     (1.0, "8B"),
-    (2.0, "32B"),
-    (3.0, "200–350B"),
-    (4.0, "~1T"),
+    (2.0, "16B"),    # midpoint of the stretched 8B->32B segment (= exactly 16B)
+    (3.0, "32B"),
+    (4.0, "128B"),
+    (5.0, "1T"),
     (UNKNOWN_X, "?"),
 ]
-X_LIM: Tuple[float, float] = (-0.45, 5.45)
+X_LIM: Tuple[float, float] = (-0.5, 6.5)
 
 
 def size_to_x(size: Optional[float]) -> float:
     """Map a size in billions of params to an x position (see ``X_KNOTS``).
 
-    ``None`` / NaN (size undisclosed) maps to :data:`UNKNOWN_X`.  Sizes outside
-    the knot range are linearly extrapolated (in log space) from the nearest
-    segment, so e.g. GLM-4.7 (357B) lands just to the right of the 256B knot.
+    ``None`` / NaN (undisclosed) maps to :data:`UNKNOWN_X`.  Sizes outside the
+    knot range are linearly extrapolated (in log space) from the nearest segment.
     """
     if size is None or (isinstance(size, float) and np.isnan(size)):
         return UNKNOWN_X
@@ -129,90 +131,125 @@ def size_to_x(size: Optional[float]) -> float:
 
 
 # ===========================================================================
-# 2. PER-MODEL DISPLAY CONFIG
+# 2. CATEGORY COLOURS  (drives both dots and the legend)
+# ===========================================================================
+
+GROUP_COLORS: Dict[str, str] = {
+    "ours":         "#C15F3C",  # terracotta — the hero colour
+    "our_baseline": "#4E6E94",  # denim
+    "past_work":    "#9C6E3F",  # caramel
+    "open_weights": "#3F8B85",  # teal
+    "closed":       "#8E5F94",  # plum
+}
+GROUP_LABELS: Dict[str, str] = {
+    "ours":         "TMax (ours)",
+    "our_baseline": "Our base models",
+    "past_work":    "Prior terminal agents",
+    "open_weights": "Open-weight (best)",
+    "closed":       "Closed (best)",
+}
+GROUP_ORDER: List[str] = ["ours", "our_baseline", "past_work", "open_weights", "closed"]
+
+
+# ===========================================================================
+# 3. PER-MODEL DISPLAY CONFIG  (hand-tune everything here)
 # ===========================================================================
 #
 # Keyed by the exact ``model_name`` in the CSV.  Every field is optional:
 #
 #   logo        : filename in scripts/plot/media (PNG). None -> coloured dot.
+#                 When set, the logo *is the marker*, centred on the exact point.
 #   logo_scale  : per-model multiplier on the (otherwise uniform) logo size.
-#   label       : annotation text (defaults to the model name).
-#   dx, dy      : annotation offset from the point, in *points* (typographic).
-#   ha, va      : annotation horizontal / vertical alignment.
-#   x_offset    : nudge the point horizontally, in x *data* units.  Handy for
-#                 fanning out models that share a size (and so an x position),
-#                 or for separating the undisclosed-size models in the "?" zone.
-#   ours        : True -> emphasised (bold, dark label, optional halo).
-#   color       : dot colour override (only used when logo is None).
-#   show_label  : set False to hide the text label for this point.
+#   label       : annotation text (defaults to the model name; "" hides it).
+#   dx, dy      : name-label offset from the point, in points (default: below).
+#   ha, va      : name-label alignment.
+#   x_offset    : nudge the point horizontally, in x *data* units.  Kept at 0 for
+#                 every sized model so it sits at its TRUE size on the axis; only
+#                 used to fan out the undisclosed-size closed models (all share
+#                 the single "?" column, so some spread there is unavoidable).
+#   leader      : True -> draw a thin dashed line from the point to the label
+#                 (for crowded / coincident markers where the label is offset far).
+#   show        : set False to omit the model entirely.
 #
 # Anything not listed falls back to DEFAULTS below.
 
-OURS_LOGO = "Tmax-Logo.png"
+OURS_LOGO = "TMax-Logo-2-transparent.png"
+QWEN_LOGO = "Qwen_logo.png"
+OPENAI_LOGO = "openai.png"
+NVIDIA_LOGO = "nvidia-logo.png"
+DEEPSEEK_LOGO = "deepseek-ai-icon-seeklogo.png"
 
 MODEL_STYLE: Dict[str, dict] = {
-    # ---- ours (TMax) ------------------------------------------------------
-    "TMax-9b": dict(logo=OURS_LOGO, logo_scale=1.5, ours=True, label="TMax-9B (Ours)",
-                    dx=0, dy=25, ha="center", va="bottom"),
-    "Qwen3.6-27B-TMax": dict(logo=OURS_LOGO, ours=True, label="TMax-27B (Ours)",
-                             dx=0, dy=15, ha="center", va="bottom"),
-    "TMax3.5-4b": dict(logo=OURS_LOGO, ours=True, label="TMax-4B (Ours)",
-                       dx=10, dy=10, ha="left", va="bottom"),
-    # ---- Qwen base models -------------------------------------------------
-    "Qwen3-8b": dict(logo="Qwen_logo.png", label="Qwen3-8B", x_offset=-0.02,
-                     dx=0, dy=-24, ha="center", va="top"),
-    "Qwen3.5-9b": dict(logo="Qwen_logo.png", label="Qwen3.5-9B",
-                       dx=-12, dy=6, ha="right", va="bottom"),
-    "Qwen3.6-27B": dict(logo="Qwen_logo.png", label="Qwen3.6-27B",
-                        dx=0, dy=15, ha="center", va="bottom"),
-    "Qwen3.5-4b": dict(logo="Qwen_logo.png", label="Qwen3.5-4B",
-                       dx=0, dy=-24, ha="center", va="top"),
-    # ---- closed / frontier ------------------------------------------------
-    "Claude Haiku": dict(logo="Claude_AI_logo.png", logo_scale=0.9,
-                         label="Claude Haiku", x_offset=-0.27,
-                         dx=0, dy=-24, ha="center", va="top"),
-    "Gpt5-Mini": dict(logo="openai.png", logo_scale=0.8, label="GPT-5-Mini",
-                      x_offset=0.14, dx=0, dy=20, ha="center", va="bottom"),
-    "MiniMax-M2.1": dict(logo="minimax-logo.png", label="MiniMax-M2.1 (229B)",
-                         dx=0, dy=-24, ha="center", va="top"),
-    "MiniMax-M2.7": dict(logo="minimax-logo.png", label="MiniMax-M2.7 (229B)",
-                         dx=0, dy=20, ha="center", va="bottom"),
-    "GLM-4.7": dict(logo="GLM-Zai-Logo.png", logo_scale=0.8,
-                    label="GLM-4.7 (357B)", dx=0, dy=16, ha="center", va="bottom"),
-    "MAI-Thinking-V1": dict(logo="Microsoft_AI_Logo.png", logo_scale=1.0,
-                            label="MAI-Thinking-V1\n(35B active, ~1T total)",
-                            dx=0, dy=-20, ha="center", va="top"),
-    # ---- research baselines (plain dots) ----------------------------------
-    "Nemotron-Terminal-8B": dict(label="Nemotron-Terminal-8B", x_offset=0.06,
-                                 dx=8, dy=0, ha="left", va="center"),
-    "Endless-Terminal-8B (OT-SFT)": dict(label="Endless-Terminal-8B",
-                                         x_offset=0.16,
-                                         dx=8, dy=2, ha="left", va="center"),
-    "OpenThoughts-Agent-V1-8B": dict(label="OpenThoughts-Agent-8B",
-                                     x_offset=-0.14,
-                                     dx=-8, dy=0, ha="right", va="center"),
+    # ---- ours (TMax) — the hero -------------------------------------------
+    "TMax-9B": dict(logo=OURS_LOGO, logo_scale=1.25, label="TMax-9B",
+                    dx=18, dy=2, ha="left", va="center"),
+    "TMax-4B": dict(logo=OURS_LOGO, logo_scale=1.1, label="TMax-4B",
+                    dx=18, dy=2, ha="left", va="center"),
+    # ---- our base models (Qwen) -------------------------------------------
+    "Qwen3.5-2B": dict(logo=QWEN_LOGO, logo_scale=0.75, label="Qwen3.5-2B",
+                       show=False, dx=14, dy=-2, ha="left", va="center"),
+    "Qwen3.5-4B": dict(logo=QWEN_LOGO, logo_scale=0.85, label="Qwen3.5-4B",
+                       dx=0, dy=-16, ha="center", va="top"),
+    "Qwen3-8B": dict(logo=QWEN_LOGO, logo_scale=0.90, label="Qwen3-8B",
+                     dx=15, dy=1, ha="left", va="center"),
+    "Qwen3.5-9B": dict(logo=QWEN_LOGO, label="Qwen3.5-9B",
+                       dx=0, dy=-22, ha="center", va="top"),
+    # ---- prior terminal agents --------------------------------------------
+    "Nemotron-Terminal-8B": dict(logo=NVIDIA_LOGO, logo_scale=0.63, label="Nemotron-8B",
+                                 dx=14, dy=0, ha="left", va="center"),
+    "Nemotron-Terminal-14B": dict(logo=NVIDIA_LOGO, logo_scale=0.66, label="Nemotron-14B",
+                                  dx=0, dy=15, ha="center", va="bottom"),
+    "Nemotron-Terminal-32B": dict(logo=NVIDIA_LOGO, logo_scale=0.70, label="Nemotron-32B",
+                                  dx=0, dy=15, ha="center", va="bottom"),
+    "TermiGen-Qwen2.5-32B": dict(label="TermiGen-32B", leader=True,
+                                 dx=5, dy=-30, ha="left", va="top"),
+    "Endless-Terminals-8B": dict(label="Endless-8B",
+                                 dx=14, dy=0, ha="left", va="center"),
     "TerminalTraj-7B": dict(label="TerminalTraj-7B",
-                            dx=-8, dy=0, ha="right", va="center"),
-    "TerminalTraj-14B": dict(label="TerminalTraj-14B",
-                             dx=8, dy=2, ha="left", va="center"),
-    "TerminalTraj-32B": dict(label="TerminalTraj-32B", x_offset=0.1,
-                             dx=8, dy=-2, ha="left", va="center"),
-    "TermiGen-Qwen3-32B": dict(label="TermiGen-Qwen3-32B"),
-    "TermiGen-Qwen2.5-Coder-32B": dict(label="TermiGen-Qwen2.5-32B"),
+                            dx=0, dy=-7, ha="center", va="top"),
+    "TerminalTraj-14B": dict(label="TerminalTraj-14B", leader=True,
+                             dx=0, dy=-33, ha="left", va="top"),
+    "TerminalTraj-32B": dict(label="TerminalTraj-32B",
+                             dx=14, dy=0, ha="left", va="center"),
+    "LiberCoder-32B": dict(label="LiberCoder-32B", leader=True,
+                           dx=-5, dy=-20, ha="right", va="top"),
+    "LiberCoder-235B-A22B": dict(label="LiberCoder-235B-A22B",
+                                 dx=0, dy=-7, ha="center", va="top"),
+    # ---- open-weight frontier ---------------------------------------------
+    "GPT-OSS-120B": dict(logo=OPENAI_LOGO, logo_scale=0.75, label="GPT-OSS-120B",
+                         dx=0, dy=-19, ha="center", va="top"),
+    "Kimi-K2.5": dict(logo="Kimi-logo-2025.png", logo_scale=0.95, label="Kimi-K2.5",
+                      dx=18, dy=0, ha="left", va="center"),
+    "MiniMax-M2.7": dict(logo="minimax-logo.png", logo_scale=1.0, label="MiniMax-M2.7",
+                         dx=0, dy=-16, ha="center", va="top"),
+    "DeepSeek-V3.2": dict(logo=DEEPSEEK_LOGO, logo_scale=1.0, label="DeepSeek-V3.2",
+                          dx=0, dy=-20, ha="center", va="top"),
+    "GLM-5": dict(logo="GLM-Zai-Logo.png", logo_scale=0.82, label="GLM-5",
+                  dx=16, dy=0, ha="left", va="center"),
+    # ---- closed (undisclosed size; live in the "?" column) ----------------
+    "Claude-Sonnet-4.6": dict(logo="Claude_AI_logo.png", logo_scale=0.95,
+                              label="Claude-Sonnet-4.6",
+                              dx=0, dy=-22, ha="center", va="top"),
+    "Claude-Haiku-4.5": dict(logo="Claude_AI_logo.png", logo_scale=0.78,
+                             label="Claude-Haiku-4.5", x_offset=-0.22,
+                             dx=0, dy=-21, ha="center", va="top"),
+    "GPT-5-mini": dict(logo=OPENAI_LOGO, logo_scale=0.95, label="GPT-5-mini",
+                       x_offset=0.22, dx=0, dy=-20, ha="center", va="top"),
+    "GPT-5-nano": dict(logo=OPENAI_LOGO, logo_scale=0.75, label="GPT-5-nano",
+                       x_offset=0.0, dx=0, dy=-18, ha="center", va="top"),
 }
 
 DEFAULTS = dict(
     logo=None,
     logo_scale=1.0,
     label=None,
-    dx=8.0,
-    dy=0.0,
+    dx=0.0,
+    dy=-15.0,
+    ha="center",
+    va="top",
     x_offset=0.0,
-    ha="left",
-    va="center",
-    ours=False,
-    color=None,
-    show_label=True,
+    leader=False,
+    show=True,
 )
 
 
@@ -226,7 +263,7 @@ def style_for(model: str) -> dict:
 
 
 # ===========================================================================
-# 3. FIGURE STYLE
+# 4. FIGURE STYLE
 # ===========================================================================
 
 
@@ -238,54 +275,69 @@ class TeaserStyle:
     font_family: str = "serif"
     font_serif: Sequence[str] = field(default_factory=lambda: ["DejaVu Serif"])
     font_size: float = 14.0
-    title_size: float = 21.0
     axes_label_size: float = 16.0
     tick_size: float = 14.0
-    annotation_size: float = 11.5
-    annotation_size_ours: float = 13.0
+    annotation_size: float = 10.5
+    annotation_size_ours: float = 12.5
+    legend_size: float = 12.0
 
     # Layout / spines
-    figsize: Tuple[float, float] = (13.5, 7.0)
+    figsize: Tuple[float, float] = (14.0, 7.0)
     spine_color: str = "#808080"
     spine_linewidth: float = 1.25
 
     # Grid
     grid: bool = True
-    grid_alpha: float = 0.18
+    grid_alpha: float = 0.16
     grid_linestyle: str = "--"
 
-    # Title / axis labels
-    title: str = "Terminal-Bench 2.0: performance vs. model size"
-    title_pad: float = 18.0
+    # Title (dropped by default per author feedback) / axis labels
+    title: str = ""
+    title_pad: float = 16.0
     title_weight: str = "bold"
     xlabel: str = "Model size (billions of parameters)"
     ylabel: str = "Terminal-Bench 2.0 (%)"
-    ylim: Tuple[float, float] = (0.0, 52.0)
+    ylim: Tuple[float, float] = (0.0, 60.0)
 
-    # Logos — normalised so each occupies ~the same bounding box.
-    #   logo_target_in : target *max* dimension of every logo, in inches.
-    logo_target_in: float = 0.52
+    # Logos — normalised so each occupies ~the same bounding box (logo == marker).
+    logo_target_in: float = 0.40   # target *max* dimension of every logo, inches
 
-    # Dots (research baselines without a logo)
-    palette_name: str = "anthropic_book"
-    dot_size: float = 90.0
-    dot_color: str = "#8A7B6B"          # muted warm grey
+    # Dots — fallback marker for models without a logo
+    dot_size: float = 70.0
+    dot_color: str = "#8A7B6B"      # muted warm grey for no-logo baselines
     dot_edge_color: str = "white"
     dot_edge_width: float = 1.1
 
-    # Emphasis for "ours"
-    ours_color: str = "#C15F3C"         # terracotta (anthropic_book #1)
-    ours_halo: bool = True
-    ours_halo_scale: float = 1.55       # halo radius relative to logo box
-    ours_halo_alpha: float = 0.16
-    annotation_color: str = "#5A5148"   # muted text for non-ours labels
+    # Emphasis for "ours" (halo off — the bold caption alone carries it)
+    ours_halo: bool = False
+    ours_halo_size: float = 620.0   # scatter `s` for the soft halo
+    ours_halo_alpha: float = 0.20
+    annotation_color: str = "#4A433B"   # label text colour (non-ours)
 
-    # Right-hand "frontier / large" band
+    # Error bars (vertical, ± std from the CSV)
+    show_errorbars: bool = True
+    errorbar_alpha: float = 0.5
+    errorbar_lw: float = 1.3
+    errorbar_capsize: float = 3.0
+    errorbar_color: str = "#7A7065"     # neutral so it doesn't fight the logos
+
+    # "Very large / undisclosed size" overlay band (right side)
     frontier_band: bool = True
-    frontier_x: float = 2.58            # left edge of the shaded band
+    frontier_x: float = 3.5             # left edge of the shaded band
     frontier_color: str = "#C9BBA9"
-    frontier_alpha: float = 0.14
+    frontier_alpha: float = 0.16
     frontier_label: str = "Very large  /  undisclosed size"
+
+    # Dashed leader lines (point -> label) for crowded coincident markers
+    leader_color: str = "#888888"
+    leader_lw: float = 0.8
+    leader_alpha: float = 0.5
+    leader_linestyle: str = "--"
+
+    # Legend (off by default — markers are mostly logos, not coloured dots)
+    legend: bool = False
+    legend_loc: str = "upper left"
+    legend_bbox: Tuple[float, float] = (0.01, 0.99)
 
     # Output
     dpi: int = 220
@@ -298,7 +350,6 @@ def _apply_rc(style: TeaserStyle) -> None:
             "font.family": style.font_family,
             "font.serif": list(style.font_serif),
             "font.size": style.font_size,
-            "axes.titlesize": style.title_size,
             "axes.labelsize": style.axes_label_size,
             "xtick.labelsize": style.tick_size,
             "ytick.labelsize": style.tick_size,
@@ -308,15 +359,17 @@ def _apply_rc(style: TeaserStyle) -> None:
 
 
 # ===========================================================================
-# 4. DATA LOADING
+# 5. DATA LOADING
 # ===========================================================================
 
 
 @dataclass
 class Row:
     model: str
+    group: str
     size_b: Optional[float]
-    tb2: Optional[float]
+    tb2: float
+    std: Optional[float]
     x: float
 
 
@@ -330,18 +383,27 @@ def load_rows(csv_path: Path) -> Tuple[List[Row], List[str]]:
             if not model:
                 continue
             tb2_raw = (r.get("tb2") or "").strip()
-            if not tb2_raw:                      # "NEED EVAL" -> not ready yet
+            if not tb2_raw:                      # TODO / unreleased -> not ready
                 skipped.append(model)
                 continue
             size_raw = (r.get("size_b") or "").strip()
+            std_raw = (r.get("tb2_std") or "").strip()
             size = float(size_raw) if size_raw else None
-            tb2 = float(tb2_raw)
-            rows.append(Row(model=model, size_b=size, tb2=tb2, x=size_to_x(size)))
+            rows.append(
+                Row(
+                    model=model,
+                    group=(r.get("group") or "past_work").strip(),
+                    size_b=size,
+                    tb2=float(tb2_raw),
+                    std=float(std_raw) if std_raw else None,
+                    x=size_to_x(size),
+                )
+            )
     return rows, skipped
 
 
 # ===========================================================================
-# 5. LOGO HANDLING
+# 6. LOGO HANDLING
 # ===========================================================================
 
 _LOGO_CACHE: Dict[str, np.ndarray] = {}
@@ -349,44 +411,52 @@ _LOGO_CACHE: Dict[str, np.ndarray] = {}
 
 def _load_logo(name: str) -> np.ndarray:
     if name not in _LOGO_CACHE:
-        path = MEDIA / name
-        _LOGO_CACHE[name] = np.asarray(Image.open(path).convert("RGBA"))
+        _LOGO_CACHE[name] = np.asarray(Image.open(MEDIA / name).convert("RGBA"))
     return _LOGO_CACHE[name]
 
 
 def _logo_zoom(img: np.ndarray, style: TeaserStyle, scale: float) -> float:
     """Zoom so the logo's *max* dimension equals ``logo_target_in`` inches.
 
-    OffsetImage renders ``zoom * native_pixels`` points, so a constant target
-    in inches is ``target_in * 72 / max(h, w)``.  This makes every logo share
-    the same bounding box regardless of source resolution; ``scale`` is the
-    per-model fine-tune multiplier.
+    OffsetImage renders ``zoom * native_pixels`` points, so a constant target in
+    inches is ``target_in * 72 / max(h, w)`` — uniform on-figure size regardless
+    of source resolution; ``scale`` is the per-model fine-tune multiplier.
     """
     h, w = img.shape[:2]
     return (style.logo_target_in * 72.0 / max(h, w)) * scale
 
 
 # ===========================================================================
-# 6. RENDER
+# 7. RENDER
 # ===========================================================================
+
+
+def _draw_x_break(ax, style: TeaserStyle) -> None:
+    """Draw a // break on the bottom spine between the 1T tier and the ? column."""
+    trans = ax.get_xaxis_transform()  # x in data coords, y in axes fraction
+    # White-out a short gap on the bottom spine.
+    ax.plot([BREAK_X - 0.12, BREAK_X + 0.12], [0, 0], transform=trans,
+            color="white", lw=style.spine_linewidth + 2.0, clip_on=False, zorder=11)
+    # Two parallel diagonal slashes.
+    for s in (-0.06, 0.06):
+        ax.plot([BREAK_X + s - 0.07, BREAK_X + s + 0.07], [-0.022, 0.022],
+                transform=trans, color=style.spine_color,
+                lw=style.spine_linewidth, clip_on=False, zorder=12)
 
 
 def render(rows: List[Row], style: TeaserStyle, out_base: Path) -> None:
     _apply_rc(style)
     fig, ax = plt.subplots(figsize=style.figsize)
 
-    # --- frontier band (drawn first, behind everything) --------------------
+    # "very large / undisclosed size" overlay band (behind everything)
     if style.frontier_band:
         ax.axvspan(style.frontier_x, X_LIM[1], color=style.frontier_color,
                    alpha=style.frontier_alpha, zorder=0, linewidth=0)
-        ax.text(
-            (style.frontier_x + X_LIM[1]) / 2.0, style.ylim[1] - 1.4,
-            style.frontier_label, ha="center", va="top",
-            fontsize=style.annotation_size - 0.5, color="#9A8B79",
-            style="italic", zorder=1,
-        )
+        ax.text((style.frontier_x + X_LIM[1]) / 2.0, style.ylim[1] - 1.6,
+                style.frontier_label, ha="center", va="top",
+                fontsize=style.annotation_size, color="#9A8B79",
+                style="italic", zorder=1)
 
-    # --- grid / spines -----------------------------------------------------
     if style.grid:
         ax.grid(True, axis="both", alpha=style.grid_alpha,
                 linestyle=style.grid_linestyle, color=style.spine_color, zorder=0)
@@ -396,48 +466,71 @@ def render(rows: List[Row], style: TeaserStyle, out_base: Path) -> None:
         ax.spines[side].set_color(style.spine_color)
         ax.spines[side].set_linewidth(style.spine_linewidth)
 
-    # --- points ------------------------------------------------------------
     for row in rows:
         cfg = style_for(row.model)
+        if not cfg["show"]:
+            continue
         x, y = row.x + cfg["x_offset"], row.tb2
+        is_ours = row.group == "ours"
 
+        # error bar (neutral colour so it never fights the logo)
+        if style.show_errorbars and row.std is not None:
+            ax.errorbar(x, y, yerr=row.std, fmt="none", ecolor=style.errorbar_color,
+                        elinewidth=style.errorbar_lw, capsize=style.errorbar_capsize,
+                        capthick=style.errorbar_lw, alpha=style.errorbar_alpha, zorder=2)
+
+        # soft halo for ours
+        if is_ours and style.ours_halo:
+            ax.scatter([x], [y], s=style.ours_halo_size, color=GROUP_COLORS["ours"],
+                       alpha=style.ours_halo_alpha, edgecolors="none", zorder=3)
+
+        # marker: logo centred on the exact point, else a coloured dot
         if cfg["logo"]:
             img = _load_logo(cfg["logo"])
-            zoom = _logo_zoom(img, style, cfg["logo_scale"])
-
-            if cfg["ours"] and style.ours_halo:
-                # soft circular halo behind our models so they pop
-                box = style.logo_target_in * cfg["logo_scale"]
-                ax.scatter(
-                    [x], [y], s=(box * style.ours_halo_scale * 72) ** 2 * 0.55,
-                    color=style.ours_color, alpha=style.ours_halo_alpha,
-                    edgecolors="none", zorder=3,
-                )
-
-            oi = OffsetImage(img, zoom=zoom, interpolation="hanning")
-            ab = AnnotationBbox(oi, (x, y), frameon=False, pad=0.0, zorder=5)
+            oi = OffsetImage(img, zoom=_logo_zoom(img, style, cfg["logo_scale"]),
+                             interpolation="hanning")
+            ab = AnnotationBbox(oi, (x, y), frameon=False, pad=0.0,
+                                zorder=8 if is_ours else 5)
             ax.add_artist(ab)
         else:
-            color = cfg["color"] or style.dot_color
-            ax.scatter(
-                [x], [y], s=style.dot_size, color=color,
-                edgecolors=style.dot_edge_color, linewidths=style.dot_edge_width,
-                zorder=4,
-            )
+            ax.scatter([x], [y], s=style.dot_size,
+                       color=GROUP_COLORS.get(row.group, style.dot_color),
+                       edgecolors=style.dot_edge_color,
+                       linewidths=style.dot_edge_width, zorder=5)
 
-        if cfg["show_label"]:
-            is_ours = cfg["ours"]
+        # name label (optionally with a dashed leader line back to the point)
+        if cfg["label"]:
+            arrowprops = None
+            if cfg["leader"]:
+                arrowprops = dict(arrowstyle="-", color=style.leader_color,
+                                  lw=style.leader_lw, alpha=style.leader_alpha,
+                                  linestyle=style.leader_linestyle,
+                                  shrinkA=1.0, shrinkB=4.0)
             ax.annotate(
                 cfg["label"], (x, y),
                 xytext=(cfg["dx"], cfg["dy"]), textcoords="offset points",
                 ha=cfg["ha"], va=cfg["va"],
                 fontsize=style.annotation_size_ours if is_ours else style.annotation_size,
                 fontweight="bold" if is_ours else "normal",
-                color=darken_hex(style.ours_color, 0.92) if is_ours else style.annotation_color,
-                zorder=6,
+                color=darken_hex(GROUP_COLORS["ours"], 0.85) if is_ours else style.annotation_color,
+                arrowprops=arrowprops,
+                zorder=7,
             )
 
-    # --- axes cosmetics ----------------------------------------------------
+    # legend (category -> colour)
+    if style.legend:
+        present = [g for g in GROUP_ORDER if any(r.group == g for r in rows)]
+        handles = [
+            Line2D([0], [0], marker="o", linestyle="none", markersize=10,
+                   markerfacecolor=GROUP_COLORS[g], markeredgecolor="white",
+                   label=GROUP_LABELS[g])
+            for g in present
+        ]
+        ax.legend(handles=handles, loc=style.legend_loc, bbox_to_anchor=style.legend_bbox,
+                  frameon=False, fontsize=style.legend_size, handletextpad=0.4,
+                  labelspacing=0.6, borderaxespad=0.0)
+
+    # axes cosmetics
     ax.set_xlim(*X_LIM)
     ax.set_ylim(*style.ylim)
     ax.set_xticks([t[0] for t in X_TICKS])
@@ -445,8 +538,11 @@ def render(rows: List[Row], style: TeaserStyle, out_base: Path) -> None:
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v)}%"))
     ax.set_xlabel(style.xlabel, labelpad=10)
     ax.set_ylabel(style.ylabel, labelpad=10)
-    ax.set_title(style.title, pad=style.title_pad, fontweight=style.title_weight)
+    if style.title:
+        ax.set_title(style.title, pad=style.title_pad, fontweight=style.title_weight)
     ax.tick_params(length=0)
+
+    _draw_x_break(ax, style)
 
     fig.tight_layout()
     out_base.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +554,7 @@ def render(rows: List[Row], style: TeaserStyle, out_base: Path) -> None:
 
 
 # ===========================================================================
-# 7. CLI
+# 8. CLI
 # ===========================================================================
 
 
@@ -468,7 +564,8 @@ def main() -> None:
     ap.add_argument("--csv", type=Path, default=DEFAULT_CSV)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT,
                     help="Output path base (no extension).")
-    ap.add_argument("--title", default=None, help="Override the figure title.")
+    ap.add_argument("--title", default=None, help="Set a figure title (default: none).")
+    ap.add_argument("--no-errorbars", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -482,6 +579,8 @@ def main() -> None:
     style = TeaserStyle()
     if args.title:
         style.title = args.title
+    if args.no_errorbars:
+        style.show_errorbars = False
     render(rows, style, args.out.resolve())
 
 

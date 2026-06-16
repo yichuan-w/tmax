@@ -23,7 +23,14 @@ import zipfile
 from huggingface_hub import HfApi
 
 # Internal pipeline artifacts that should never be uploaded.
-ALWAYS_IGNORE = ["logs/**", "_*.jsonl", "_*.txt"]
+ALWAYS_IGNORE = [
+    "logs/**",
+    "analysis/**",
+    "_*.jsonl",
+    "_*.txt",
+    "_combine_manifest.json",
+    "container.sif",
+]
 
 
 def _read_file_text(path: Path) -> str:
@@ -52,13 +59,66 @@ def is_task_verified(task_dir: Path) -> bool:
     return False
 
 
+def _load_toml(path: Path) -> dict:
+    """Load a TOML file (stdlib tomllib on 3.11+, fallback to tomli)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[no-redef]
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _read_task_metadata(td: Path) -> dict | None:
+    """Read task metadata from task.json or harbor task.toml, returning a
+    normalised dict.  Returns *None* if neither file exists."""
+    task_json = td / "task.json"
+    task_toml = td / "task.toml"
+
+    if task_json.exists():
+        with open(task_json, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {
+            "task_id": raw.get("name", td.name),
+            "domain": raw.get("domain", ""),
+            "skill_type": raw.get("skill_type", ""),
+            "primitive_skills": raw.get("primitive_skills", []),
+            "task_complexity": raw.get("task_complexity", ""),
+            "command_complexity": raw.get("command_complexity", ""),
+            "scenario": raw.get("scenario", ""),
+            "language": raw.get("language", ""),
+            "description": raw.get("description", ""),
+            "truth": raw.get("truth", ""),
+        }
+
+    if task_toml.exists():
+        raw = _load_toml(task_toml)
+        meta = raw.get("metadata", {})
+        task_sec = raw.get("task", {})
+        return {
+            "task_id": task_sec.get("name", td.name),
+            "domain": meta.get("domain", ""),
+            "skill_type": meta.get("skill_type", ""),
+            "primitive_skills": meta.get("primitive_skills", []),
+            "task_complexity": meta.get("task_complexity", ""),
+            "command_complexity": meta.get("command_complexity", ""),
+            "scenario": meta.get("scenario", ""),
+            "language": meta.get("language", ""),
+            "description": task_sec.get("description", ""),
+            "instruction": _read_file_text(td / "instruction.md"),
+        }
+
+    return None
+
+
 def build_parquet(
     input_dir: Path, *, allowed_tasks: set[str] | None = None
 ) -> Path | None:
     """Build a train.parquet from all task_* dirs for HF Dataset Viewer.
 
-    Reads each task's task.json plus its companion files and writes a single
-    Parquet file to ``<input_dir>/data/train-00000-of-00001.parquet``.
+    Reads each task's task.json (or harbor task.toml) plus companion files
+    and writes a single Parquet file to
+    ``<input_dir>/data/train-00000-of-00001.parquet``.
     HuggingFace auto-discovers parquet files under ``data/`` for preview.
 
     If *allowed_tasks* is given, only those task directory names are included.
@@ -80,34 +140,37 @@ def build_parquet(
 
     rows: list[dict] = []
     for td in task_dirs:
-        task_json_path = td / "task.json"
-        if not task_json_path.exists():
+        meta = _read_task_metadata(td)
+        if meta is None:
             continue
 
-        with open(task_json_path, "r", encoding="utf-8") as f:
-            task = json.load(f)
+        prim = meta.get("primitive_skills", [])
+        row = {
+            "task_id": meta["task_id"],
+            "domain": meta["domain"],
+            "skill_type": meta["skill_type"],
+            "primitive_skills": json.dumps(prim) if isinstance(prim, list) else str(prim),
+            "task_complexity": meta["task_complexity"],
+            "command_complexity": meta["command_complexity"],
+            "scenario": meta["scenario"],
+            "language": meta.get("language", ""),
+        }
 
-        prim = task.get("primitive_skills", [])
+        if "description" in meta and meta["description"]:
+            row["description"] = meta["description"]
+        if "truth" in meta and meta["truth"]:
+            row["truth"] = meta["truth"]
+        if "instruction" in meta and meta["instruction"]:
+            row["instruction"] = meta["instruction"]
 
-        rows.append(
-            {
-                "task_id": task.get("name", td.name),
-                "domain": task.get("domain", ""),
-                "skill_type": task.get("skill_type", ""),
-                "primitive_skills": json.dumps(prim) if isinstance(prim, list) else str(prim),
-                "task_complexity": task.get("task_complexity", ""),
-                "command_complexity": task.get("command_complexity", ""),
-                "scenario": task.get("scenario", ""),
-                "description": task.get("description", ""),
-                "truth": task.get("truth", ""),
-                "test_initial_state": _read_file_text(td / "test_initial_state.py"),
-                "test_final_state": _read_file_text(td / "test_final_state.py"),
-                "container_def": _read_file_text(td / "container.def"),
-            }
-        )
+        row["test_initial_state"] = _read_file_text(td / "test_initial_state.py")
+        row["test_final_state"] = _read_file_text(td / "test_final_state.py")
+        row["container_def"] = _read_file_text(td / "container.def")
+
+        rows.append(row)
 
     if not rows:
-        print("No valid task.json files found, skipping parquet")
+        print("No valid task metadata files found, skipping parquet")
         return None
 
     df = pd.DataFrame(rows)
@@ -149,12 +212,11 @@ def _build_compact_staging(
     if allowed_tasks is not None:
         task_dirs = [d for d in task_dirs if d.name in allowed_tasks]
 
-    # Copy data/ (parquet) and analysis/ — must be real copies since
-    # upload_folder does not follow symlinks.
-    for name in ("data", "analysis"):
-        src = input_dir / name
-        if src.is_dir():
-            shutil.copytree(src, staging_dir / name)
+    # Copy data/ (parquet) — must be a real copy since upload_folder
+    # does not follow symlinks.  analysis/ and logs/ are excluded.
+    data_src = input_dir / "data"
+    if data_src.is_dir():
+        shutil.copytree(data_src, staging_dir / "data")
 
     # Zip all eligible task folders
     zip_path = staging_dir / "tasks.zip"

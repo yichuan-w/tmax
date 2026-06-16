@@ -49,6 +49,8 @@ _DISPLAY_NAMES = {
     "termigen": "TermiGen",
     "terminaltraj": "TerminalTraj",
     "r2e_gym": "R2E-Gym",
+    "cli_gym": "CLI-Gym",
+    "swe_smith": "SWE-smith",
     "tblite": "TBLite (openthoughts-tblite@2.0)",
     "tb2": "TB2 (terminal-bench@2.0)",
 }

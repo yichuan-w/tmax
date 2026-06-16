@@ -18,6 +18,8 @@
 #   TG_TASKS_DIR      Default: rl_data/output/tasks_termigen
 #   TT_TASKS_DIR      Default: rl_data/output/tasks_terminaltraj
 #   R2E_TASKS_DIR     Default: rl_data/output/tasks_r2e_gym
+#   CLI_GYM_TASKS_DIR    Default: rl_data/output/tasks_cli_gym
+#   SWE_SMITH_TASKS_DIR  Default: rl_data/output/tasks_swe_smith
 #   BENCH_CACHE_DIR   Default: rl_data/output/_decon_benchmarks
 #   DECON_OUT_DIR     Default: rl_data/output/decontamination_0518
 #   NGRAM_N           Default: "13,8"  (comma-separated list of n-gram sizes)
@@ -34,6 +36,8 @@ OT_TASKS_DIR="${OT_TASKS_DIR:-rl_data/output/tasks_openthoughts_agent_rl}"
 TG_TASKS_DIR="${TG_TASKS_DIR:-rl_data/output/tasks_termigen}"
 TT_TASKS_DIR="${TT_TASKS_DIR:-rl_data/output/tasks_terminaltraj}"
 R2E_TASKS_DIR="${R2E_TASKS_DIR:-rl_data/output/tasks_r2e_gym}"
+CLI_GYM_TASKS_DIR="${CLI_GYM_TASKS_DIR:-rl_data/output/tasks_cli_gym}"
+SWE_SMITH_TASKS_DIR="${SWE_SMITH_TASKS_DIR:-rl_data/output/tasks_swe_smith}"
 BENCH_CACHE_DIR="${BENCH_CACHE_DIR:-rl_data/output/_decon_benchmarks}"
 DECON_OUT_DIR="${DECON_OUT_DIR:-rl_data/output/decontamination_0518}"
 NGRAM_N="${NGRAM_N:-13,8}"
@@ -50,6 +54,8 @@ echo "  OT             : $OT_TASKS_DIR"
 echo "  TermiGen       : $TG_TASKS_DIR"
 echo "  TerminalTraj   : $TT_TASKS_DIR"
 echo "  R2E Gym        : $R2E_TASKS_DIR"
+echo "  CLI-Gym        : $CLI_GYM_TASKS_DIR"
+echo "  SWE-smith      : $SWE_SMITH_TASKS_DIR"
 echo "  bench cache    : $BENCH_CACHE_DIR"
 echo "  out dir        : $DECON_OUT_DIR"
 echo "  n / stride     : $NGRAM_N / $NGRAM_STRIDE"
@@ -102,6 +108,12 @@ if [[ "${SKIP_RUN:-0}" != "1" ]]; then
   fi
   if [[ -d "$R2E_TASKS_DIR" ]]; then
     DATASET_ARGS+=(--dataset "r2e_gym:$R2E_TASKS_DIR")
+  fi
+  if [[ -d "$CLI_GYM_TASKS_DIR" ]]; then
+    DATASET_ARGS+=(--dataset "cli_gym:$CLI_GYM_TASKS_DIR")
+  fi
+  if [[ -d "$SWE_SMITH_TASKS_DIR" ]]; then
+    DATASET_ARGS+=(--dataset "swe_smith:$SWE_SMITH_TASKS_DIR")
   fi
 
   BENCH_ARGS=()

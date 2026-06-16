@@ -457,8 +457,8 @@ Note: --depth controls which directories are SHOWN in the tree.
     parser.add_argument(
         'path',
         nargs='?',
-        default='/gpfs/scrubbed/osey/Dataset_Distillation',
-        help='Directory path to analyze (default: /gpfs/scrubbed/osey/Dataset_Distillation)'
+        default='/gpfs/scrubbed/osey/tmax',
+        help='Directory path to analyze (default: /gpfs/scrubbed/osey/tmax)'
     )
     
     group = parser.add_mutually_exclusive_group(required=True)
