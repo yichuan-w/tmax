@@ -13,6 +13,7 @@ Usage:
     # Then load your model as usual.
 """
 
+import deepspeed
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5 import modeling_qwen3_5
@@ -22,12 +23,44 @@ from open_instruct import logger_utils
 
 logger = logger_utils.setup_logger(__name__)
 
+_ORIGINAL_GATED_DELTA_NET_INIT = modeling_qwen3_5.Qwen3_5GatedDeltaNet.__init__
+_ZERO3_EXTERNAL_CONV1D_REGISTERED_PARAM_ID = "_open_instruct_zero3_external_conv1d_registered_param_id"
+
+
+def _register_zero3_external_conv1d_parameter(module):
+    """Register the child conv weight read directly by GatedDeltaNet.forward."""
+    weight = module.conv1d.weight
+    if getattr(module, _ZERO3_EXTERNAL_CONV1D_REGISTERED_PARAM_ID, None) == id(weight):
+        return False
+    if not hasattr(weight, "ds_id"):
+        return False
+
+    deepspeed.zero.register_external_parameter(module, weight)
+    setattr(module, _ZERO3_EXTERNAL_CONV1D_REGISTERED_PARAM_ID, id(weight))
+    return True
+
+
+def register_qwen3_5_zero3_external_parameters(model):
+    """Register Qwen3.5 external params after ZeRO-3 init or checkpoint load."""
+    model = getattr(model, "module", model)
+    registered = 0
+    for module in model.modules():
+        if isinstance(module, modeling_qwen3_5.Qwen3_5GatedDeltaNet):
+            registered += int(_register_zero3_external_conv1d_parameter(module))
+    if registered:
+        logger.info(f"Registered {registered} Qwen3.5 conv1d weights as ZeRO-3 external parameters")
+    return registered
+
+
+def _patched_gated_delta_net_init(self, *args, **kwargs):
+    _ORIGINAL_GATED_DELTA_NET_INIT(self, *args, **kwargs)
+    _register_zero3_external_conv1d_parameter(self)
+
 
 def _patched_gated_delta_net_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
     """GatedDeltaNet forward with seq_idx and cu_seqlens support for packing."""
     seq_idx = kwargs.get("seq_idx")
     cu_seqlens = kwargs.get("cu_seqlens")
-
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     batch_size, seq_len, _ = hidden_states.shape
@@ -55,13 +88,31 @@ def _patched_gated_delta_net_forward(self, hidden_states, cache_params=None, att
             conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
             cache_params.conv_states[self.layer_idx] = conv_state
         if self.causal_conv1d_fn is not None:
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
+            cp_context = kwargs.get("cp_context")
+            if cp_context is not None:
+                # Use the CP-aware conv so that rank r+1 receives the last
+                # (kernel_size - 1) tokens from rank r as initial conv state.
+                # Without this, continuation chunks start from zero conv state,
+                # corrupting the first (kernel_size - 1) output tokens on each
+                # non-first rank.  causal_conv1d_cp expects [1, T, D] not [1, D, T].
+                # Lazy import: fla.modules.conv.cp is only needed under SP.
+                from fla.modules.conv.cp.ops import causal_conv1d_cp  # noqa: PLC0415
+
+                mixed_qkv = causal_conv1d_cp(
+                    x=mixed_qkv.permute(0, 2, 1),
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    cp_context=cp_context,
+                ).permute(0, 2, 1)
+            else:
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
         else:
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
@@ -81,7 +132,15 @@ def _patched_gated_delta_net_forward(self, hidden_states, cache_params=None, att
     if not use_precomputed_states:
         chunk_kwargs = {}
         if getattr(self.chunk_gated_delta_rule, "__module__", "").startswith("fla."):
-            chunk_kwargs["cu_seqlens"] = cu_seqlens
+            cp_context = kwargs.get("cp_context")
+            if cp_context is not None:
+                chunk_kwargs["cp_context"] = cp_context
+                # cp_context.cu_seqlens carries rank-local boundaries derived from the
+                # global sequence layout; the locally-computed cu_seqlens (from position
+                # resets on this rank's slice) omits continuation ranges on non-first ranks.
+                chunk_kwargs["cu_seqlens"] = cp_context.cu_seqlens
+            else:
+                chunk_kwargs["cu_seqlens"] = cu_seqlens
 
         core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
             query,
@@ -148,8 +207,54 @@ def _patched_decoder_layer_forward(
     return hidden_states
 
 
+def _set_class_attr(cls, name, value):
+    setattr(cls, name, value)
+
+
 def patch_qwen3_5_packing():
     """Apply the packing fix to Qwen3.5 GatedDeltaNet and DecoderLayer."""
-    modeling_qwen3_5.Qwen3_5GatedDeltaNet.forward = _patched_gated_delta_net_forward
-    modeling_qwen3_5.Qwen3_5DecoderLayer.forward = _patched_decoder_layer_forward
+    _set_class_attr(modeling_qwen3_5.Qwen3_5GatedDeltaNet, "__init__", _patched_gated_delta_net_init)
+    _set_class_attr(modeling_qwen3_5.Qwen3_5GatedDeltaNet, "forward", _patched_gated_delta_net_forward)
+    _set_class_attr(modeling_qwen3_5.Qwen3_5DecoderLayer, "forward", _patched_decoder_layer_forward)
     logger.info("Applied Qwen3.5 packing patch for GatedDeltaNet seq_idx/cu_seqlens support")
+
+
+def patch_hf_lm_head_fp32(model):
+    """Keep a Hugging Face causal LM's final projection in fp32."""
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None and hasattr(model, "module"):
+        lm_head = getattr(model.module, "lm_head", None)
+    if lm_head is None:
+        logger.warning("Could not apply fp32 lm_head patch because model has no lm_head")
+        return False
+
+    is_zero3_lm_head = any(hasattr(param, "ds_id") for param in lm_head.parameters(recurse=False))
+    if not is_zero3_lm_head:
+        lm_head.float()
+    if getattr(lm_head, "_open_instruct_lm_head_fp32_patch", False):
+        return False
+
+    original_forward = lm_head.forward
+
+    def patched_forward(hidden_states, *args, **kwargs):
+        if not isinstance(hidden_states, torch.Tensor):
+            return original_forward(hidden_states, *args, **kwargs)
+
+        weight = getattr(lm_head, "weight", None)
+        if is_zero3_lm_head:
+            if args or kwargs:
+                return original_forward(hidden_states.float(), *args, **kwargs)
+            bias = getattr(lm_head, "bias", None)
+            return F.linear(
+                hidden_states.float(),
+                weight.float(),
+                bias.float() if isinstance(bias, torch.Tensor) else bias,
+            )
+
+        hidden_states = hidden_states.float()
+        return original_forward(hidden_states, *args, **kwargs)
+
+    lm_head.forward = patched_forward
+    lm_head._open_instruct_lm_head_fp32_patch = True
+    logger.info("Applied fp32 lm_head patch to Hugging Face model")
+    return True

@@ -54,12 +54,15 @@ from open_instruct.dataset_transformation import (
     get_cached_dataset_tulu,
     visualize_token,
 )
+from open_instruct.grpo_utils import build_fla_cp_context_for_sample
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlattening
+from open_instruct.qwen3_5_packing_patch import patch_qwen3_5_packing
 from open_instruct.utils import (
     ArgumentParserPlus,
     clean_last_n_checkpoints,
     get_last_checkpoint_path,
+    get_optimizer_grouped_parameters,
     get_wandb_tags,
     is_beaker_job,
     launch_ai2_evals_on_weka,
@@ -70,6 +73,25 @@ from open_instruct.utils import (
 )
 
 logger = get_logger(__name__)
+
+
+_MAX_SEQ_LENGTH_TRANSFORM_FNS = {
+    "sft_tulu_tokenize_and_truncate_v1",
+    "last_turn_tulu_tokenize_and_truncate_v1",
+}
+_MAX_TOKEN_LENGTH_FILTER_FNS = {"sft_length_and_label_filter_v1"}
+
+
+def build_transform_fn_args(dataset_transform_fn: list[str], max_seq_length: int | None) -> list[dict[str, int | None]]:
+    transform_fn_args = []
+    for fn_name in dataset_transform_fn:
+        if fn_name in _MAX_SEQ_LENGTH_TRANSFORM_FNS:
+            transform_fn_args.append({"max_seq_length": max_seq_length})
+        elif fn_name in _MAX_TOKEN_LENGTH_FILTER_FNS:
+            transform_fn_args.append({"max_token_length": max_seq_length})
+        else:
+            transform_fn_args.append({})
+    return transform_fn_args
 
 
 @dataclass
@@ -127,6 +149,8 @@ class FlatArguments:
     """A list of datasets (local or HF) to sample from."""
     dataset_mixer_list_splits: list[str] = field(default_factory=lambda: ["train"])
     """The dataset splits to use for training"""
+    dataset_mixer_list_config_names: list[str] = field(default_factory=list)
+    """The Hugging Face dataset config names to use for training datasets"""
     dataset_transform_fn: list[str] = field(
         default_factory=lambda: ["sft_tulu_tokenize_and_truncate_v1", "sft_tulu_filter_v1"]
     )
@@ -327,10 +351,8 @@ class FlatArguments:
         if self.dataset_name is None and self.dataset_mixer is None and self.dataset_mixer_list is None:
             raise ValueError("Need either a dataset name, dataset mixer, or dataset mixer list.")
         if (
-            (self.dataset_name is not None and (self.dataset_mixer is not None or self.dataset_mixer_list is not None))
-            or (self.dataset_name is not None)
-            or (self.dataset_mixer is not None and self.dataset_mixer_list is not None)
-        ):
+            self.dataset_name is not None and (self.dataset_mixer is not None or self.dataset_mixer_list is not None)
+        ) or (self.dataset_mixer is not None and self.dataset_mixer_list is not None):
             raise ValueError("Cannot provide two dataset selection mechanisms.")
         if self.try_launch_beaker_eval_jobs and not self.push_to_hub:
             raise ValueError("Cannot launch Beaker evaluation jobs without pushing to the Hub.")
@@ -497,8 +519,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     if args.dataset_mixer is not None:
         args.dataset_mixer_list = [item for pair in args.dataset_mixer.items() for item in pair]
+    dataset_mixer_list_config_names = args.dataset_mixer_list_config_names
+    if not dataset_mixer_list_config_names and args.dataset_config_name is not None:
+        dataset_mixer_list_config_names = [args.dataset_config_name]
     with accelerator.main_process_first():
-        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
+        transform_fn_args = build_transform_fn_args(args.dataset_transform_fn, args.max_seq_length)
         train_dataset = get_cached_dataset_tulu(
             dataset_mixer_list=args.dataset_mixer_list,
             dataset_mixer_list_splits=args.dataset_mixer_list_splits,
@@ -511,6 +536,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             hf_entity=args.hf_entity,
             dataset_local_cache_dir=args.dataset_local_cache_dir,
             dataset_skip_cache=args.dataset_skip_cache,
+            dataset_mixer_list_config_names=dataset_mixer_list_config_names,
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
@@ -534,6 +560,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             args.config_name,
             revision=args.model_revision,
             trust_remote_code=tc.trust_remote_code,
+            local_files_only=True,
             **args.additional_model_arguments,
         )
     elif args.model_name_or_path:
@@ -541,6 +568,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             args.model_name_or_path,
             revision=args.model_revision,
             trust_remote_code=tc.trust_remote_code,
+            local_files_only=True,
             **args.additional_model_arguments,
         )
     else:
@@ -568,6 +596,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 device_map=device_map,
                 dtype=torch.bfloat16,
                 attn_implementation=model_utils.detect_hf_attn_implementation(),
+                local_files_only=True,
             )
         elif args.use_liger_kernel:
             from liger_kernel.transformers import AutoLigerKernelForCausalLM  # noqa: PLC0415
@@ -583,6 +612,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 trust_remote_code=tc.trust_remote_code,
                 low_cpu_mem_usage=args.low_cpu_mem_usage,
                 attn_implementation=model_utils.detect_hf_attn_implementation(),
+                local_files_only=True,
                 # liger-kernel specific args
                 fused_linear_cross_entropy=True,
             )
@@ -596,6 +626,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 low_cpu_mem_usage=args.low_cpu_mem_usage,
                 dtype=torch.bfloat16,
                 attn_implementation=model_utils.detect_hf_attn_implementation(),
+                local_files_only=True,
             )
     else:
         logger.info("Training new model from scratch")
@@ -637,7 +668,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    _conv_kernel_size = getattr(model.config, "linear_conv_kernel_dim", None) or getattr(
+        getattr(model.config, "text_config", None), "linear_conv_kernel_dim", None
+    )
+    _is_hybrid = _conv_kernel_size is not None
+    _is_hybrid_sp = _is_hybrid and args.sequence_parallel_size > 1
+    if _is_hybrid:
+        patch_qwen3_5_packing()
+    _sp_group = accelerator.torch_device_mesh["sp"].get_group() if args.sequence_parallel_size > 1 else None
+
     # DataLoaders creation:
+    if args.packing and args.sequence_parallel_size > 1:
+        raise ValueError(
+            "packing=True is not compatible with sequence_parallel_size > 1: the Ulysses SP "
+            "adapter cannot split variable-length packing tensors (cu_seq_lens_q, max_length, "
+            "etc.) across ranks. Use packing=False with SP."
+        )
     if args.packing:
         collate_fn = TensorDataCollatorWithFlattening()
     else:
@@ -656,6 +702,17 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                     for k in batch:
                         pad_value = -100 if k == "labels" else 0
                         batch[k] = torch.nn.functional.pad(batch[k], (0, pad_len), value=pad_value)
+                if "attention_mask" not in batch:
+                    raise ValueError("Expected attention_mask in batch when sequence_parallel_size > 1.")
+                # Ulysses shards this tensor after collation, so create positions
+                # for the full pre-shard sequence.
+                seq_len = batch["input_ids"].shape[1]
+                batch["position_ids"] = (
+                    torch.arange(seq_len, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(batch["input_ids"].shape[0], -1)
+                    .contiguous()
+                )
                 return batch
         else:
             collate_fn = base_collate_fn
@@ -666,15 +723,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     )
 
     # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "layer_norm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
-    ]
+    optimizer_grouped_parameters = get_optimizer_grouped_parameters(model, args.weight_decay)
+
     if args.use_qlora:
         from bitsandbytes.optim import AdamW  # noqa: PLC0415
 
@@ -822,23 +872,44 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             local_pred_tokens += pred_tokens_in_batch
             local_pred_tokens_this_log_period += pred_tokens_in_batch
 
+            fwd_extra: dict = {}
+            if _is_hybrid_sp:
+                if "position_ids" not in batch:
+                    raise ValueError(
+                        "Qwen3.5 hybrid sequence-parallel training requires pre-shard position_ids. "
+                        "Check that the SP collator added position_ids before Ulysses sharding."
+                    )
+                local_pos = batch["position_ids"]
+                if local_pos.shape[0] != 1:
+                    raise ValueError("Qwen3.5 hybrid sequence-parallel training currently requires batch size 1.")
+                local_pos_row = local_pos[0:1].contiguous()
+                gathered = [torch.zeros_like(local_pos_row) for _ in range(args.sequence_parallel_size)]
+                torch.distributed.all_gather(gathered, local_pos_row, group=_sp_group)
+                global_pos = torch.cat(gathered, dim=1)
+                fwd_extra["cp_context"] = build_fla_cp_context_for_sample(
+                    global_position_ids=global_pos,
+                    sp_world_size=args.sequence_parallel_size,
+                    sp_group=_sp_group,
+                    conv_kernel_size=_conv_kernel_size,
+                    local_seq_len=local_pos.shape[1],
+                )
+
             with accelerator.accumulate(model):
                 if args.load_balancing_loss:
-                    outputs = model(**batch, use_cache=False, output_router_logits=True)
+                    outputs = model(**batch, use_cache=False, output_router_logits=True, **fwd_extra)
                     total_aux_loss += outputs.aux_loss.detach().float()
                 else:
-                    outputs = model(**batch, use_cache=False)
+                    outputs = model(**batch, use_cache=False, **fwd_extra)
 
                 loss = outputs.loss
                 del outputs
 
                 if args.sequence_parallel_size > 1:
-                    sp_group = accelerator.torch_device_mesh["sp"].get_group()
-                    losses_per_rank = torch.distributed.nn.functional.all_gather(loss.unsqueeze(0), group=sp_group)
+                    losses_per_rank = torch.distributed.nn.functional.all_gather(loss.unsqueeze(0), group=_sp_group)
                     labels_for_counting = batch["shift_labels"]
                     good_tokens = (labels_for_counting != -100).view(-1).sum().float()
                     good_tokens_per_rank = torch.distributed.nn.functional.all_gather(
-                        good_tokens.unsqueeze(0), group=sp_group
+                        good_tokens.unsqueeze(0), group=_sp_group
                     )
                     total_loss_sp = sum(
                         losses_per_rank[rank] * good_tokens_per_rank[rank]

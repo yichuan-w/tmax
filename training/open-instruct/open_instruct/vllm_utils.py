@@ -17,22 +17,20 @@
 
 import argparse
 import asyncio
-import contextlib
 import dataclasses
 import os
 import queue
 import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from concurrent import futures
-from datetime import timedelta
 from typing import Any
 
 import aiohttp
 import backoff
-import datasets
 import deepspeed
 import openai
 import ray
@@ -44,17 +42,11 @@ from ray.util import queue as ray_queue
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.distributed._composable.fsdp import FSDPModule
-from torch.distributed.distributed_c10d import (
-    Backend,
-    PrefixStore,
-    ProcessGroup,
-    Store,
-    _new_process_group_helper,
-    _world,
-    default_pg_timeout,
-    rendezvous,
-)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from vllm.config import WeightTransferConfig
+from vllm.distributed.weight_transfer.base import WeightTransferInitRequest, WeightTransferUpdateRequest
+from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerSendWeightsArgs, IPCWeightTransferEngine
+from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -77,6 +69,29 @@ from open_instruct.environments.tools.parsers import ToolParser, create_tool_par
 from open_instruct.ground_truth_utils import RewardConfig
 
 logger = logger_utils.setup_logger(__name__)
+SANDBOX_TIMING_LOGS = os.getenv("SWERL_SANDBOX_TIMING_LOGS", "").strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SANDBOX_TIMING_LOG_THRESHOLD_S = float(os.getenv("SWERL_SANDBOX_TIMING_LOG_THRESHOLD_S", "1.0"))
+RESET_FAILURE_ZERO_REWARD = os.getenv("SWERL_RESET_FAILURE_ZERO_REWARD", "").strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+}
+RESET_FAILURE_ZERO_REWARD_MARKERS = (
+    "reset failed after",
+    "http+docker://localhost",
+    "failed to find image",
+    "no such image",
+    "image not known",
+    "locating image with id",
+)
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: vLLM 0.18.0 hybrid model dtype serialization bug
@@ -99,11 +114,67 @@ logger = logger_utils.setup_logger(__name__)
 MambaSpec.__dataclass_fields__["dtypes"].type = tuple[torch.dtype, ...]
 MambaSpec.__annotations__["dtypes"] = tuple[torch.dtype, ...]
 
+
+def _patch_vllm_model_class_lm_head_fp32(model_cls: type) -> bool:
+    """Keep a vLLM model's final projection in fp32."""
+    if getattr(model_cls, "_open_instruct_lm_head_fp32_patch", False):
+        return False
+    if not hasattr(model_cls, "compute_logits"):
+        return False
+
+    original_init = model_cls.__init__
+    original_compute_logits = model_cls.compute_logits
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        lm_head = getattr(self, "lm_head", None)
+        if lm_head is not None and hasattr(lm_head, "float"):
+            lm_head.float()
+
+    def patched_compute_logits(self, hidden_states, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states.float()
+        return original_compute_logits(self, hidden_states, *args, **kwargs)
+
+    model_cls.__init__ = patched_init
+    model_cls.compute_logits = patched_compute_logits
+    model_cls._open_instruct_lm_head_fp32_patch = True
+    return True
+
+
+def patch_vllm_qwen3_5_lm_head_fp32() -> None:
+    # vLLM's Qwen3.5 implementation keeps the lm_head in the model dtype by
+    # default. This mirrors vLLM's MiniMax fix: do the final projection in fp32
+    # to avoid bf16 rounding in logits/logprobs.
+    patched_classes = []
+    for module_name in (
+        "vllm.model_executor.models.qwen3_5",
+        "vllm.model_executor.models.qwen3_5_mtp",
+    ):
+        try:
+            module = __import__(module_name, fromlist=[""])
+        except ImportError:
+            continue
+
+        for attr_name in dir(module):
+            if not attr_name.startswith("Qwen3_5"):
+                continue
+            model_cls = getattr(module, attr_name)
+            if isinstance(model_cls, type) and _patch_vllm_model_class_lm_head_fp32(model_cls):
+                patched_classes.append(f"{module_name}.{attr_name}")
+
+    if patched_classes:
+        logger.info("Applied vLLM Qwen3.5 fp32 lm_head patch to %s", ", ".join(sorted(patched_classes)))
+
+
 NUM_PREFETCH_WORKERS = 2
 DRAIN_ACTIVE_TASKS_SLEEP_S = 1
 SHOULD_STOP_TIMEOUT_S = 0.1
 INFERENCE_INIT_TIMEOUT_S = 1200
 VLLM_HEALTH_CHECK_TIMEOUT_S = 600.0
+VLLM_OPENAI_TIMEOUT_S = 3600.0
+VLLM_OPENAI_MAX_RETRIES = 5
+DEFAULT_TOOL_CALL_TIMEOUT_S = 120.0
 
 
 def model_dims_from_vllm_config(vllm_config: "vllm.config.VllmConfig") -> utils.ModelDims:
@@ -302,7 +373,7 @@ def split_request_id(full_request_id: str) -> dict:
     return {"base_id": "_".join(parts[:-1]), "request_index": int(parts[-1])}
 
 
-def process_completed_request(request_id, outs, current_time, use_tools, request_metadata):
+def process_completed_request(request_id, outs, current_time, use_tools, request_metadata, dataset_lookup=None):
     """Process a completed request with all its samples and return the result.
 
     Args:
@@ -311,9 +382,14 @@ def process_completed_request(request_id, outs, current_time, use_tools, request
         current_time: Current timestamp for performance metrics
         use_tools: Boolean indicating if tools were used
         request_metadata: Dictionary containing metadata for all requests
+        dataset_lookup: Optional callable ``(index, is_eval) -> dict`` that resolves
+            the dataset example for this request, applying any ground-truth overrides
+            from the request metadata.
 
     Returns:
-        Tuple of (result, is_eval) where result is a GenerationResult and is_eval is a boolean
+        Tuple of (result, is_eval, example) where example is the resolved dataset
+        row (with any ground-truth override applied), or None if no dataset_lookup
+        was provided.
     """
     final_output = RequestOutput(
         request_id=request_id,
@@ -379,8 +455,18 @@ def process_completed_request(request_id, outs, current_time, use_tools, request
         start_time=metadata["start_time"],
         logprobs=logprobs,
         model_step=metadata.get("model_step"),
+        model_steps=[metadata.get("model_step") for _ in response_ids],
     )
-    return result, metadata["is_eval"]
+    is_eval = metadata["is_eval"]
+
+    example = None
+    if dataset_lookup is not None:
+        example = dataset_lookup(metadata["index"], is_eval)
+        ground_truth_from_request = metadata.get("ground_truth")
+        if ground_truth_from_request is not None and not is_eval:
+            example[GROUND_TRUTHS_KEY] = ground_truth_from_request
+
+    return result, is_eval, example
 
 
 def ray_noset_visible_devices(env_vars=os.environ):
@@ -402,59 +488,6 @@ def ray_noset_visible_devices(env_vars=os.environ):
         "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
     ]
     return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
-
-
-# Copy from pytorch to allow creating multiple main groups.
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
-def init_process_group(
-    backend: str | Backend = None,
-    init_method: str | None = None,
-    timeout: timedelta | None = None,
-    world_size: int = -1,
-    rank: int = -1,
-    store: Store | None = None,
-    group_name: str | None = None,
-    pg_options: Any | None = None,
-    device_id: torch.device | int | None = None,
-) -> ProcessGroup:
-    assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
-
-    if store is not None:
-        assert world_size > 0, "world_size must be positive if using store"
-        assert rank >= 0, "rank must be non-negative if using store"
-    elif init_method is None:
-        init_method = "env://"
-
-    backend = Backend(backend) if backend else Backend("undefined")
-
-    if timeout is None:
-        timeout = default_pg_timeout
-
-    # backward compatible API
-    if store is None:
-        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
-        store, rank, world_size = next(rendezvous_iterator)
-        store.set_timeout(timeout)
-
-        # Use a PrefixStore to avoid accidental overrides of keys used by
-        # different systems (e.g. RPC) in case the store is multi-tenant.
-        store = PrefixStore(group_name, store)
-
-    pg, _ = _new_process_group_helper(
-        world_size,
-        rank,
-        [],
-        backend,
-        store,
-        group_name=group_name,
-        backend_options=pg_options,
-        timeout=timeout,
-        device_id=device_id,
-    )
-
-    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
-
-    return pg
 
 
 @backoff.on_exception(backoff.constant, (aiohttp.ClientError, RuntimeError, TimeoutError), max_time=60, interval=0.5)
@@ -494,6 +527,7 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         "start_time": time.perf_counter(),
         "active_tools": request.active_tools,
         "env_config": request.env_config,
+        "ground_truth": request.ground_truth,
     }
 
     for j in range(request.generation_config.n):
@@ -543,28 +577,30 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
     ordered_outs = sorted(outputs, key=lambda x: split_request_id(x.request_id)["request_index"])
 
     current_time = time.perf_counter()
-    result, is_eval = process_completed_request(
+
+    def _dataset_lookup(index: int, is_eval_req: bool) -> dict:
+        ds = actor.eval_dataset if is_eval_req else actor.train_dataset
+        idx_map = actor._eval_index_map if is_eval_req else actor._train_index_map
+        return dict(ds[idx_map[index]])
+
+    result, is_eval, example = process_completed_request(
         base_request_id,
         ordered_outs,
         current_time,
         actor.request_outputs[base_request_id]["use_tools"],
         actor.request_metadata,
+        dataset_lookup=_dataset_lookup,
     )
 
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
 
-    dataset = actor.eval_dataset if is_eval else actor.train_dataset
-    result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, dataset, is_eval)
+    result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
     results_queue.put(result)
 
 
-async def compute_rewards(
-    actor: "LLMRayActor", result: GenerationResult, dataset: datasets.Dataset, is_eval: bool
-) -> tuple[list[float], dict]:
-    index_map = actor._eval_index_map if is_eval else actor._train_index_map
-    example = dataset[index_map[result.index]]
+async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, example: dict) -> tuple[list[float], dict]:
     decoded_responses = actor.llm_engine.tokenizer.batch_decode(result.responses, skip_special_tokens=True)
 
     k = len(result.responses)
@@ -595,7 +631,7 @@ class LLMRayActor:
         tool_stop_sequences: list[str] | None = None,
         max_steps: int = 5,
         per_turn_max_tokens: int | None = None,
-        tool_call_timeout: float = 1800.0,
+        tool_call_timeout: float = DEFAULT_TOOL_CALL_TIMEOUT_S,
         mask_tool_use: bool = True,
         pools: dict[str, ray.actor.ActorHandle] | None = None,
         bundle_indices: list[int] | None = None,
@@ -604,9 +640,12 @@ class LLMRayActor:
         eval_results_queue: ray_queue.Queue,
         actor_manager: ray.actor.ActorHandle,
         inflight_updates: bool,
+        inflight_updates_recompute_kv_cache: bool = False,
         reward_config: RewardConfig | None = None,
         train_dataset=None,
         eval_dataset=None,
+        inference_batch_size: int | None = None,
+        lm_head_fp32: bool = False,
         **kwargs,
     ):
         assert_threaded_actor(self)
@@ -619,6 +658,7 @@ class LLMRayActor:
             mask_tool_use,
             pools,
             inflight_updates,
+            inflight_updates_recompute_kv_cache,
             reward_config,
             train_dataset,
             eval_dataset,
@@ -628,9 +668,15 @@ class LLMRayActor:
         noset_visible_devices = kwargs.pop("noset_visible_devices")
         distributed_executor_backend = kwargs.get("distributed_executor_backend")
         self._setup_gpu_visibility(noset_visible_devices, distributed_executor_backend)
+        if lm_head_fp32:
+            patch_vllm_qwen3_5_lm_head_fp32()
         self._setup_and_start_async_engine(args, bundle_indices, kwargs)
         self._init_openai_client()
-        self.inference_batch_size = self.get_kv_cache_info()
+        if inference_batch_size is not None:
+            logger.info(f"Using manually configured inference_batch_size={inference_batch_size}")
+            self.inference_batch_size = inference_batch_size
+        else:
+            self.inference_batch_size = self.get_kv_cache_info()
         self._init_executor()
         # comes after executor as it requires tokenizer access.
         self._init_tool_parser(tool_parser_type)
@@ -643,6 +689,7 @@ class LLMRayActor:
         mask_tool_use: bool,
         pools: dict[str, ray.actor.ActorHandle] | None,
         inflight_updates: bool,
+        inflight_updates_recompute_kv_cache: bool,
         reward_config: RewardConfig | None,
         train_dataset,
         eval_dataset,
@@ -653,6 +700,7 @@ class LLMRayActor:
         self.mask_tool_use = mask_tool_use
         self.pools: dict[str, ray.actor.ActorHandle] = pools or {}
         self.inflight_updates = inflight_updates
+        self.inflight_updates_recompute_kv_cache = inflight_updates_recompute_kv_cache
         self.request_metadata = {}
         self.active_tasks = {}
         self.request_outputs = {}
@@ -660,6 +708,7 @@ class LLMRayActor:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.current_model_step: int = 0
+        self._generation_paused = False
         self._train_index_map: dict[int, int] = (
             {train_dataset[i]["index"]: i for i in range(len(train_dataset))} if train_dataset is not None else {}
         )
@@ -721,6 +770,9 @@ class LLMRayActor:
         engine_args = vllm.AsyncEngineArgs(*args, **kwargs)
         engine_args.disable_log_stats = True
         engine_args.disable_cascade_attn = True
+        # Use float32 for the SSM recurrent state cache to avoid bf16 rounding
+        # that compounds at every decode step and inflates vLLM-vs-HF KL.
+        engine_args.mamba_ssm_cache_dtype = "float32"
 
         init_complete = threading.Event()
         self.loop = None
@@ -777,10 +829,21 @@ class LLMRayActor:
 
     def _init_openai_client(self) -> None:
         base_url = f"http://127.0.0.1:{self.server_port}/v1"
-        self.client = openai.AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=3600)
+        self.client = openai.AsyncOpenAI(
+            base_url=base_url,
+            api_key="EMPTY",
+            timeout=VLLM_OPENAI_TIMEOUT_S,
+            max_retries=VLLM_OPENAI_MAX_RETRIES,
+        )
         self.model_name = self.llm_engine.vllm_config.model_config.model
 
-        logger.info(f"Waiting for vLLM OpenAI API server to be ready at {base_url}")
+        logger.info(
+            "Waiting for vLLM OpenAI API server to be ready at %s "
+            "(timeout=%.1fs, max_retries=%d)",
+            base_url,
+            VLLM_OPENAI_TIMEOUT_S,
+            VLLM_OPENAI_MAX_RETRIES,
+        )
 
         asyncio.run(_check_health(self.server_port))
         logger.info("vLLM OpenAI API server is ready")
@@ -804,11 +867,7 @@ class LLMRayActor:
     def process_from_queue(self) -> None:
         finalize_futures: list[futures.Future] = []
         while True:
-            try:
-                sub_request = self.completion_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            completion_future = accumulate_completions(self, sub_request)
+            completion_future = accumulate_completions(self, self.completion_queue.get())
             if completion_future is not None:
                 finalize_futures.append(completion_future)
 
@@ -816,58 +875,56 @@ class LLMRayActor:
             [future.result() for future in done]
             finalize_futures = list(not_done)
 
-    def init_process_group(
-        self,
-        master_address: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        group_name: str,
-        backend: str,
-        use_ray: bool = False,
-        timeout_minutes: int = 120,
-    ) -> None:
-        future = asyncio.run_coroutine_threadsafe(
-            self.llm_engine.collective_rpc(
-                "init_process_group",
-                args=(
-                    master_address,
-                    master_port,
-                    rank_offset,
-                    world_size,
-                    group_name,
-                    backend,
-                    use_ray,
-                    timeout_minutes,
-                ),
-            ),
-            self.loop,
-        )
-        return future.result(timeout=timeout_minutes * 60)
+    def init_weight_transfer_engine(self, request: WeightTransferInitRequest) -> None:
+        return self._run_async(self.llm_engine.init_weight_transfer_engine(request))
 
     def _run_async(self, coro: Awaitable[Any]) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return future.result()
 
-    def _prepare_weight_update(self, name: str, dtype: str) -> None:
-        # Wait for all active requests to complete.
-        while not self.inflight_updates and len(self.active_tasks) > 0:
+    def _drain_active_tasks(self, reason: str) -> None:
+        if len(self.active_tasks) > 0:
+            logger.info(f"Waiting for {len(self.active_tasks)} active vLLM request(s) before {reason}")
+        while len(self.active_tasks) > 0:
             self.check_background_threads()
             time.sleep(DRAIN_ACTIVE_TASKS_SLEEP_S)
 
-        expected_dtype = str(self.llm_engine.model_config.dtype)
-        assert dtype == expected_dtype, f"Mismatched dtype for {name}: received {dtype!r}, expected {expected_dtype!r}"
-
-    def update_weights_batch(self, param_metadata: list[tuple[str, str, tuple[int, ...]]]) -> None:
-        for name, dtype, _ in param_metadata:
-            self._prepare_weight_update(name, dtype)
-        return self._run_async(self.llm_engine.collective_rpc("update_weights_batch", args=(param_metadata,)))
-
-    def update_weight_cuda_ipc(self, name: str, dtype: str, shape: tuple[int, ...], ipc_handles: list[Any]) -> None:
-        self._prepare_weight_update(name, dtype)
-        return self._run_async(
-            self.llm_engine.collective_rpc("update_weight_cuda_ipc", args=(name, dtype, shape, ipc_handles))
+    def sleep(self) -> None:
+        if not self.inflight_updates:
+            self._drain_active_tasks("pause generation")
+        self._run_async(
+            self.llm_engine.pause_generation(mode="keep", clear_cache=self.inflight_updates_recompute_kv_cache)
         )
+        self._generation_paused = True
+
+    def wake_up(self) -> None:
+        if not self._generation_paused:
+            return
+        self._run_async(self.llm_engine.resume_generation())
+        self._generation_paused = False
+
+    def update_weights(
+        self,
+        names_or_update_dict,
+        dtype_names: list[str] | None = None,
+        shapes: list[list[int]] | None = None,
+        packed: bool = True,
+    ) -> None:
+        if not self.inflight_updates:
+            self._drain_active_tasks("weight update")
+        if isinstance(names_or_update_dict, dict):
+            # IPC path (single_gpu_mode): called as update_weights({"update_info": {...}})
+            update_info = names_or_update_dict["update_info"]
+        else:
+            # NCCL path: called as update_weights(names, dtype_names, shapes, packed=packed)
+            update_info = {
+                "names": names_or_update_dict,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "packed": packed,
+            }
+        request = WeightTransferUpdateRequest(update_info=update_info)
+        return self._run_async(self.llm_engine.update_weights(request))
 
     def reset_prefix_cache(self) -> None:
         return self._run_async(self.llm_engine.reset_prefix_cache())
@@ -879,13 +936,20 @@ class LLMRayActor:
         self.current_model_step = model_step
 
     def check_background_threads(self) -> None:
-        if self._prefetch_future.done():
-            self._prefetch_future.result()
-        if self._process_future.done():
-            self._process_future.result()
-        for task in self.active_tasks.values():
-            if task.done():
-                task.result()
+        def check_future(source: str, future: futures.Future) -> None:
+            if not future.done():
+                return
+            try:
+                future.result()
+            except Exception as e:
+                raise RuntimeError(
+                    f"{source} failed with {type(e).__name__}: {e}\n{traceback.format_exc()}"
+                ) from None
+
+        check_future("vLLM prefetch worker", self._prefetch_future)
+        check_future("vLLM completion worker", self._process_future)
+        for request_id, task in list(self.active_tasks.items()):
+            check_future(f"vLLM request task {request_id}", task)
         if not self.loop_thread.is_alive():
             raise RuntimeError(
                 "vLLM engine loop thread has died. Check logs for errors in EngineCore or async engine."
@@ -942,6 +1006,26 @@ def _register_tool_dispatch(
     return actor_map, tool_names, response_roles
 
 
+def _select_tool_call_format_error_message(pool_setup: "PoolSetup", allowed_tools: set[str]) -> str | None:
+    """Pick the active env/tool-specific format-error feedback message, if any."""
+    for name in sorted(allowed_tools):
+        message = pool_setup.tool_call_format_error_messages.get(name)
+        if message:
+            return message
+    for name in pool_setup.active_env_names:
+        message = pool_setup.tool_call_format_error_messages.get(name)
+        if message:
+            return message
+    return None
+
+
+def _should_zero_reward_reset_failure(error: BaseException) -> bool:
+    if not RESET_FAILURE_ZERO_REWARD:
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in RESET_FAILURE_ZERO_REWARD_MARKERS)
+
+
 @dataclasses.dataclass
 class PoolSetup:
     """Result of acquiring and resetting all configured tool/env pools for a request."""
@@ -950,6 +1034,7 @@ class PoolSetup:
     actor_map: dict[str, Any]
     allowed_tools: set[str]
     tool_response_roles: dict[str, str]
+    tool_call_format_error_messages: dict[str, str]
     active_env_names: list[str]
     text_env_names: list[str]
 
@@ -965,50 +1050,63 @@ async def _acquire_and_reset_pools(
     acquired: dict[str, tuple[Any, Any]] = {}
     actor_map: dict[str, Any] = {}
     tool_response_roles: dict[str, str] = {}
+    tool_call_format_error_messages: dict[str, str] = {}
     active_env_names: list[str] = []
     text_env_names: list[str] = []
 
-    for pool_name in sorted(configured_tools):
-        pool = pools.get(pool_name)
-        if pool is None:
-            raise ValueError(f"No pool for target '{pool_name}'. Available: {list(pools.keys())}")
+    try:
+        for pool_name in sorted(configured_tools):
+            pool = pools.get(pool_name)
+            if pool is None:
+                raise ValueError(f"No pool for target '{pool_name}'. Available: {list(pools.keys())}")
 
-        target_actor = await pool.acquire.remote()
-        acquired[pool_name] = (pool, target_actor)
-        actor_map[pool_name] = target_actor
-        active_env_names.append(pool_name)
+            entry = env_config.env_configs.get(pool_name, EnvConfigEntry(env_name=pool_name, is_text_env=False))
+            reset_kwargs = {"max_steps": env_config.max_steps, **entry.kwargs}
+            target_actor, target_tools = await pool.acquire_reset.remote(reset_kwargs)
+            acquired[pool_name] = (pool, target_actor)
+            actor_map[pool_name] = target_actor
+            active_env_names.append(pool_name)
 
-        entry = env_config.env_configs.get(pool_name, EnvConfigEntry(env_name=pool_name, is_text_env=False))
-        _, target_tools = await target_actor.reset.remote(**entry.kwargs)
-        target_response_role = await target_actor.get_response_role.remote()
-        tool_response_roles[pool_name] = target_response_role
+            target_response_role = await target_actor.get_response_role.remote()
+            tool_response_roles[pool_name] = target_response_role
+            target_format_error_message = await target_actor.get_tool_call_format_error_message.remote()
+            if target_format_error_message:
+                tool_call_format_error_messages[pool_name] = target_format_error_message
 
-        new_actors, new_tools, new_roles = _register_tool_dispatch(
-            pool_name, target_actor, target_tools, target_response_role, actor_map
-        )
-        actor_map.update(new_actors)
-        allowed_tools.update(new_tools)
-        tool_response_roles.update(new_roles)
+            new_actors, new_tools, new_roles = _register_tool_dispatch(
+                pool_name, target_actor, target_tools, target_response_role, actor_map
+            )
+            actor_map.update(new_actors)
+            allowed_tools.update(new_tools)
+            tool_response_roles.update(new_roles)
+            if target_format_error_message:
+                for name in new_tools:
+                    tool_call_format_error_messages[name] = target_format_error_message
 
-        if entry.is_text_env:
-            text_env_names.append(pool_name)
-            allowed_tools.add(pool_name)
+            if entry.is_text_env:
+                text_env_names.append(pool_name)
+                allowed_tools.add(pool_name)
 
-    if len(text_env_names) > 1:
-        raise ValueError(f"Only one text environment may be active per rollout, got: {sorted(text_env_names)}")
+        if len(text_env_names) > 1:
+            raise ValueError(f"Only one text environment may be active per rollout, got: {sorted(text_env_names)}")
 
-    unresolved = allowed_tools - set(actor_map.keys())
-    if unresolved:
-        raise ValueError(
-            f"Some allowed tools have no active dispatch target: {sorted(unresolved)}. "
-            f"Active targets: {sorted(actor_map.keys())}"
-        )
+        unresolved = allowed_tools - set(actor_map.keys())
+        if unresolved:
+            raise ValueError(
+                f"Some allowed tools have no active dispatch target: {sorted(unresolved)}. "
+                f"Active targets: {sorted(actor_map.keys())}"
+            )
+    except Exception:
+        for pool, acquired_actor in acquired.values():
+            pool.release.remote(acquired_actor)
+        raise
 
     return PoolSetup(
         acquired=acquired,
         actor_map=actor_map,
         allowed_tools=allowed_tools,
         tool_response_roles=tool_response_roles,
+        tool_call_format_error_messages=tool_call_format_error_messages,
         active_env_names=active_env_names,
         text_env_names=text_env_names,
     )
@@ -1016,7 +1114,15 @@ async def _acquire_and_reset_pools(
 
 async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_params: SamplingConfig):
     """Process a single async request with tool/environment support."""
+    request_start_time = time.perf_counter()
+    timings: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+
+    def add_timing(name: str, start_time: float) -> None:
+        timings[name] += time.perf_counter() - start_time
+
     await _check_health(actor.server_port)
+    add_timing("health_check", request_start_time)
 
     response_tokens: list[int] = []
     response_logprobs: list[float] = []
@@ -1043,6 +1149,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
         actor_map={},
         allowed_tools=allowed_tools,
         tool_response_roles={},
+        tool_call_format_error_messages={},
         active_env_names=[],
         text_env_names=[],
     )
@@ -1054,11 +1161,27 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 f"Available envs/tools: {sorted(configured_tools)}"
             )
 
-        pool_setup = await _acquire_and_reset_pools(actor.pools, configured_tools, env_config, allowed_tools)
+        phase_start_time = time.perf_counter()
+        try:
+            pool_setup = await _acquire_and_reset_pools(actor.pools, configured_tools, env_config, allowed_tools)
+        except Exception as e:
+            add_timing("acquire_reset_pools", phase_start_time)
+            if not _should_zero_reward_reset_failure(e):
+                raise
+            error_msg = f"Environment reset failed; marking rollout as zero reward: {e}"
+            logger.warning(error_msg)
+            rollout.done = True
+            rollout.rewards.append(0.0)
+            rollout.tool_error += error_msg
+            rollout.tool_call_stats.append(ToolCallStats(tool_name="env_reset", success=False, runtime=0.0))
+            max_steps = 0
+        else:
+            add_timing("acquire_reset_pools", phase_start_time)
         actor_map = pool_setup.actor_map
         allowed_tools = pool_setup.allowed_tools
         tool_response_roles = pool_setup.tool_response_roles
         text_env_names = pool_setup.text_env_names
+        tool_call_format_error_message = _select_tool_call_format_error_message(pool_setup, allowed_tools)
 
         while rollout.step_count < max_steps:
             if rollout.done:
@@ -1074,6 +1197,8 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
+            counts["generation_calls"] += 1
+            phase_start_time = time.perf_counter()
             api_response = await actor.client.completions.create(
                 model=actor.model_name,
                 prompt=current_prompt,
@@ -1083,11 +1208,15 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     "include_stop_str_in_output": True,
                     "skip_special_tokens": False,
                     "min_tokens": min_tokens,
+                    # Keep rollout logprobs on the same temperature-scaled policy as trainer logprobs.
+                    "logprobs_mode": "processed_logprobs",
                 },
                 **params_dict,
             )
+            add_timing("generation", phase_start_time)
 
             output = api_response.choices[0]
+            phase_start_time = time.perf_counter()
             model_tokens = list(output.token_ids)
             response_tokens.extend(model_tokens)
             current_prompt.extend(model_tokens)
@@ -1098,16 +1227,40 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 cumulative_logprob += logprob
             response_masks.extend([1] * len(model_tokens))
 
-            tool_calls = [tc for tc in actor.tool_parser.get_tool_calls(output.text) if tc.name in allowed_tools]
+            parse_result = actor.tool_parser.parse_tool_calls(output.text)
+            tool_calls = [tc for tc in parse_result.tool_calls if tc.name in allowed_tools]
+
+            format_error_feedback: list[tuple[str, str]] = []
+            if tool_call_format_error_message and not text_env_names:
+                has_wrong_tool_call = any(tc.name not in allowed_tools for tc in parse_result.tool_calls)
+
+                # No tool call at all should read like a fresh user instruction.
+                # Malformed or wrong-tool calls get regular tool feedback.
+                if not parse_result.had_tool_call:
+                    format_error_feedback.append((tool_call_format_error_message, "user"))
+                elif has_wrong_tool_call or not tool_calls:
+                    format_error_feedback.append((tool_call_format_error_message, "tool"))
 
             # Text envs: inject a shadow tool call so dispatch handles it uniformly
             for text_env_name in text_env_names:
                 tool_calls.append(EnvCall(id="", name=text_env_name, args={"text": output.text}))
+            add_timing("process_generation_output", phase_start_time)
 
-            if not tool_calls:
+            if not tool_calls and not format_error_feedback:
                 break
 
             observations: list[tuple[str, str]] = []
+            for feedback, response_role in format_error_feedback:
+                if rollout.step_count >= max_steps:
+                    break
+                rollout.step_count += 1
+                observations.append((feedback, response_role))
+                rollout.tool_error += feedback
+                rollout.rewards.append(0.0)
+                rollout.tool_call_stats.append(
+                    ToolCallStats(tool_name="tool_call_format_error", success=False, runtime=0.0)
+                )
+
             for tc in tool_calls:
                 if rollout.step_count >= max_steps:
                     break
@@ -1122,10 +1275,13 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 rollout.step_count += 1
 
                 try:
+                    counts["tool_calls"] += 1
+                    phase_start_time = time.perf_counter()
                     step_result: StepResult = await asyncio.wait_for(
                         target.step.remote(EnvCall(id=str(rollout.step_count), name=tc.name, args=tc.args)),
                         timeout=actor.tool_call_timeout,
                     )
+                    add_timing("tool_step", phase_start_time)
                     observations.append((step_result.result, tool_response_roles.get(tc.name, "tool")))
                     rollout.tool_output += step_result.result
                     rollout.rewards.append(step_result.reward)
@@ -1143,6 +1299,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                         )
                     )
                 except asyncio.TimeoutError:
+                    add_timing("tool_step", phase_start_time)
                     error_msg = f"Step '{tc.name}' timed out after {actor.tool_call_timeout}s. Args: {tc.args}"
                     logger.warning(error_msg)
                     observations.append((error_msg, "tool"))
@@ -1153,6 +1310,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                         ToolCallStats(tool_name=tc.name, success=False, runtime=actor.tool_call_timeout)
                     )
                 except Exception as e:
+                    add_timing("tool_step", phase_start_time)
                     error_msg = f"Step '{tc.name}' failed: {e}. Args: {tc.args}"
                     logger.warning(error_msg)
                     observations.append((error_msg, "tool"))
@@ -1165,6 +1323,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
             if observations:
                 exceeded_context_budget = False
+                phase_start_time = time.perf_counter()
                 for observation, response_role in observations:
                     tokens, logprobs, masks, excess = process_tool_tokens(
                         [observation],
@@ -1184,9 +1343,11 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     if excess > 0:
                         exceeded_context_budget = True
                         break
+                add_timing("process_tool_outputs", phase_start_time)
                 if exceeded_context_budget:
                     break
     finally:
+        phase_start_time = time.perf_counter()
         env_metrics: dict[str, dict[str, float]] = {}
         for env_name in pool_setup.active_env_names:
             if env_name in pool_setup.acquired:
@@ -1200,6 +1361,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             rollout.info["env_metrics"] = env_metrics
         for pool, acq_actor in pool_setup.acquired.values():
             pool.release.remote(acq_actor)
+        add_timing("env_metrics_and_release", phase_start_time)
 
     if len(response_tokens) == 0:
         eos_token_id = actor.llm_engine.tokenizer.eos_token_id
@@ -1219,6 +1381,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
         rollout_state=dataclasses.asdict(rollout),
     )
 
+    phase_start_time = time.perf_counter()
     actor.active_tasks.pop(sub_request_id, None)
     actor.completion_queue.put(
         {
@@ -1232,6 +1395,22 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             "use_tools": bool(actor.pools),
         }
     )
+    add_timing("enqueue_completion", phase_start_time)
+    total_s = time.perf_counter() - request_start_time
+    if SANDBOX_TIMING_LOGS and total_s >= SANDBOX_TIMING_LOG_THRESHOLD_S:
+        logger.info(
+            "LLMRayActor.rollout timing request_id=%s base_request_id=%s total=%.3fs counts=%s timings=%s "
+            "tokens=%s masks=%s done=%s timeout=%s",
+            sub_request_id,
+            base_request_id,
+            total_s,
+            dict(counts),
+            {key: round(value, 3) for key, value in timings.items()},
+            len(response_tokens),
+            len(response_masks),
+            rollout.done,
+            rollout.timeout,
+        )
 
 
 def get_cuda_arch_list() -> str:
@@ -1278,11 +1457,15 @@ def create_vllm_engines(
     eval_results_queue=None,
     actor_manager=None,
     inflight_updates: bool = False,
+    inflight_updates_recompute_kv_cache: bool = False,
     reward_config: RewardConfig | None = None,
     train_dataset=None,
     eval_dataset=None,
     trust_remote_code: bool = False,
     vllm_attention_backend: str | None = None,
+    vllm_gdn_prefill_backend: str | None = None,
+    inference_batch_size: int | None = None,
+    lm_head_fp32: bool = False,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
     # Use "mp" (multiprocessing) for TP > 1 when running inside a Ray actor.
@@ -1340,7 +1523,7 @@ def create_vllm_engines(
                 revision=revision,
                 tokenizer=tokenizer_name_or_path,
                 tokenizer_revision=revision,
-                worker_extension_cls="open_instruct.vllm_utils_workerwrap.WorkerWrap",
+                weight_transfer_config=WeightTransferConfig(backend="ipc" if use_hybrid_engine else "nccl"),
                 tensor_parallel_size=tensor_parallel_size,
                 enforce_eager=enforce_eager,
                 dtype="bfloat16",
@@ -1364,12 +1547,16 @@ def create_vllm_engines(
                 mask_tool_use=mask_tool_use,
                 pools=pools,
                 inflight_updates=inflight_updates,
+                inflight_updates_recompute_kv_cache=inflight_updates_recompute_kv_cache,
                 reward_config=reward_config,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 trust_remote_code=trust_remote_code,
                 attention_backend=vllm_attention_backend,
                 language_model_only=True,
+                inference_batch_size=inference_batch_size,
+                lm_head_fp32=lm_head_fp32,
+                **({"gdn_prefill_backend": vllm_gdn_prefill_backend} if vllm_gdn_prefill_backend is not None else {}),
             )
         )
 
@@ -1378,19 +1565,6 @@ def create_vllm_engines(
     )
 
     return vllm_engines
-
-
-def _send_to_vllm(
-    params: list[tuple[str, torch.nn.Parameter, torch.Size]],
-    vllm_engines: list[ray.actor.ActorHandle],
-    model_update_group: torch.distributed.ProcessGroup,
-) -> list[ray.ObjectRef]:
-    """Send parameters to vLLM engines via a single RPC + sequential NCCL broadcasts."""
-    param_metadata = [(name, str(param.dtype), tuple(shape)) for name, param, shape in params]
-    refs = [engine.update_weights_batch.remote(param_metadata) for engine in vllm_engines]
-    for _, param, _ in params:
-        torch.distributed.broadcast(param.data, 0, group=model_update_group)
-    return refs
 
 
 def _get_fsdp2_submodules(model: torch.nn.Module) -> list[tuple[str, FSDPModule]]:
@@ -1402,117 +1576,165 @@ def _get_fsdp2_submodules(model: torch.nn.Module) -> list[tuple[str, FSDPModule]
     return fsdp_modules
 
 
-def _broadcast_fsdp2_block_params(
-    block_name: str,
-    block: FSDPModule,
-    vllm_engines: list[ray.actor.ActorHandle],
-    model_update_group: torch.distributed.ProcessGroup,
-    name_mapper: Callable[[str], str] | None,
-    is_rank_0: bool,
-) -> list[ray.ObjectRef]:
-    """Broadcast parameters from one FSDP2 block to vLLM engines.
+def _prepare_params_for_sync(
+    params: list[tuple[str, torch.nn.Parameter]], name_mapper: Callable[[str], str] | None
+) -> list[tuple[str, torch.Tensor]]:
+    """Map parameter names and clone into contiguous tensors for NCCL send.
 
-    All ranks must call this (unshard/reshard are collective ops).
-    Only rank 0 actually sends to vLLM.
+    DS3 gathered tensors may be non-contiguous or views into temporary buffers.
+    Cloning ensures we send independent, contiguous tensors over NCCL.
     """
-    block.unshard()
-    try:
-        refs: list[ray.ObjectRef] = []
-        if is_rank_0:
-            batch_params = []
+    mapped_params = []
+    for n, p in params:
+        mapped_name = name_mapper(n) if name_mapper else n
+        mapped_params.append((mapped_name, p.data.contiguous().clone()))
+    return mapped_params
+
+
+def _collect_weight_metadata(
+    model: torch.nn.Module,
+    name_mapper: Callable[[str], str] | None,
+    fsdp_submodules: list[tuple[str, FSDPModule]] | None = None,
+) -> tuple[list[str], list[str], list[list[int]]]:
+    """Collect weight metadata (names, dtypes, shapes) without full parameter gathering.
+
+    For DeepSpeed stage 3, uses ds_shape. For FSDP2 DTensors, .shape returns global shape.
+    For FSDP1, param.shape returns full shape when parameters are registered (not flat).
+    """
+    names: list[str] = []
+    dtype_names: list[str] = []
+    shapes: list[list[int]] = []
+
+    if isinstance(model, FSDPModule):
+        if fsdp_submodules is None:
+            fsdp_submodules = _get_fsdp2_submodules(model)
+        for block_name, block in fsdp_submodules:
             for name, param in block.named_parameters():
                 full_name = f"{block_name}.{name}" if block_name else name
                 mapped_name = name_mapper(full_name) if name_mapper else full_name
-                batch_params.append((mapped_name, param, param.shape))
-            refs = _send_to_vllm(batch_params, vllm_engines, model_update_group)
-        return refs
-    finally:
-        block.reshard()
+                names.append(mapped_name)
+                dtype_names.append(str(param.dtype).split(".")[-1])
+                shapes.append(list(param.shape))
+    else:
+        for name, param in model.named_parameters():
+            mapped_name = name_mapper(name) if name_mapper else name
+            names.append(mapped_name)
+            dtype_names.append(str(param.dtype).split(".")[-1])
+            shape = getattr(param, "ds_shape", param.shape)
+            shapes.append(list(shape))
+
+    return names, dtype_names, shapes
 
 
-def _broadcast_params_to_vllm(
-    params: list[tuple[str, torch.nn.Parameter]],
+def _broadcast_weights_ipc(
+    model: torch.nn.Module,
     vllm_engines: list[ray.actor.ActorHandle],
-    model_update_group: torch.distributed.ProcessGroup,
     name_mapper: Callable[[str], str] | None,
+    gather_whole_model: bool,
 ) -> list[ray.ObjectRef]:
-    """Broadcast parameters to vLLM engines. Must be called on rank 0 only."""
-    batch_params = []
-    for name, param in params:
-        mapped_name = name_mapper(name) if name_mapper else name
-        shape = getattr(param, "ds_shape", param.shape)
-        batch_params.append((mapped_name, param, shape))
-    return _send_to_vllm(batch_params, vllm_engines, model_update_group)
+    """Broadcast weights using IPC backend (same-GPU / single_gpu_mode)."""
+    is_rank_0 = torch.distributed.get_rank() == 0
+    params = list(model.named_parameters())
+    deepspeed_stage_3 = any(hasattr(p, "ds_id") for p in model.parameters())
+
+    if isinstance(model, FSDP):
+        ctx = FSDP.summon_full_params(model, writeback=False, rank0_only=False)
+    elif gather_whole_model:
+        ctx = deepspeed.zero.GatheredParameters(model.parameters(), enabled=deepspeed_stage_3)
+    else:
+        for name, param in params:
+            with deepspeed.zero.GatheredParameters([param], enabled=deepspeed_stage_3):
+                if is_rank_0:
+                    mapped_params = [(name_mapper(name) if name_mapper else name, param.data)]
+                    for engine in vllm_engines:
+                        trainer_args = IPCTrainerSendWeightsArgs(mode="ray", llm_handle=engine)
+                        IPCWeightTransferEngine.trainer_send_weights(
+                            iterator=iter(mapped_params), trainer_args=trainer_args
+                        )
+        return []
+
+    with ctx:
+        if is_rank_0:
+            mapped_params = [(name_mapper(n) if name_mapper else n, p.data) for n, p in params]
+            for engine in vllm_engines:
+                trainer_args = IPCTrainerSendWeightsArgs(mode="ray", llm_handle=engine)
+                IPCWeightTransferEngine.trainer_send_weights(iterator=iter(mapped_params), trainer_args=trainer_args)
+    return []
 
 
 def broadcast_weights_to_vllm(
     model: torch.nn.Module,
     vllm_engines: list[ray.actor.ActorHandle],
-    model_update_group: torch.distributed.ProcessGroup | None,
+    model_update_group: Any | None,
     name_mapper: Callable[[str], str] | None = None,
     gather_whole_model: bool = True,
 ) -> list[ray.ObjectRef]:
-    """Broadcast model weights to vLLM engines.
+    """Broadcast model weights to vLLM engines using the native weight transfer API.
 
-    Supports both DeepSpeed and FSDP sharded models. Must be called on ALL ranks
-    when using DeepSpeed stage 3 or FSDP, since gathering is a collective operation.
-    Only rank 0 actually sends weights to vLLM.
+    Must be called on ALL ranks when using DeepSpeed stage 3 or FSDP,
+    since gathering is a collective operation. Only rank 0 sends weights.
 
-    Args:
-        model: The unwrapped model (model.module from DeepSpeed/FSDP engine)
-        vllm_engines: List of vLLM engine actor handles
-        model_update_group: Process group for distributed broadcast (only needed on rank 0)
-        name_mapper: Optional function to map parameter names (e.g., OLMo-core to HF format)
-        gather_whole_model: If True, gather all params at once (more memory, faster).
-            If False, gather each param individually (less memory, slower).
-
-    Returns:
-        List of Ray ObjectRefs for the weight update calls (empty on non-rank-0)
+    When model_update_group is None, uses IPC backend (single GPU mode).
+    Otherwise uses NCCL backend.
     """
-    is_rank_0 = torch.distributed.get_rank() == 0
-
     if isinstance(model, FSDP) and not gather_whole_model:
         raise ValueError("FSDP1 does not support per-parameter gathering. Set gather_whole_model=True.")
 
+    is_rank_0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    if is_rank_0:
+        ray.get([engine.sleep.remote() for engine in vllm_engines])
+
+    if model_update_group is None:
+        return _broadcast_weights_ipc(model, vllm_engines, name_mapper, gather_whole_model)
+
+    fsdp_submodules = _get_fsdp2_submodules(model) if isinstance(model, FSDPModule) else None
+    names, dtype_names, shapes = _collect_weight_metadata(model, name_mapper, fsdp_submodules=fsdp_submodules)
+    # Packed mode expects one transfer matching the full metadata list. When
+    # gathering per-parameter, send unpacked tensors so vLLM consumes the same
+    # granularity the trainer emits.
+    use_packed = gather_whole_model
+
+    if is_rank_0:
+        refs = [engine.update_weights.remote(names, dtype_names, shapes, packed=use_packed) for engine in vllm_engines]
+    else:
+        refs = []
+
+    trainer_args = NCCLTrainerSendWeightsArgs(group=model_update_group, packed=use_packed)
+
     if isinstance(model, FSDPModule):
-        fsdp_submodules = _get_fsdp2_submodules(model)
         if not fsdp_submodules:
             raise ValueError("FSDP2 model has no FSDP submodules.")
-        all_refs: list[ray.ObjectRef] = []
         for block_name, block in fsdp_submodules:
-            refs = _broadcast_fsdp2_block_params(
-                block_name, block, vllm_engines, model_update_group, name_mapper, is_rank_0
-            )
-            all_refs.extend(refs)
-        return all_refs
+            block.unshard()
+            try:
+                if is_rank_0:
+                    block_params = [
+                        (name_mapper(f"{block_name}.{n}") if name_mapper else f"{block_name}.{n}", p.data)
+                        for n, p in block.named_parameters()
+                    ]
+                    NCCLWeightTransferEngine.trainer_send_weights(
+                        iterator=iter(block_params), trainer_args=trainer_args
+                    )
+            finally:
+                block.reshard()
+        return refs
 
     params = list(model.named_parameters())
     deepspeed_stage_3 = any(hasattr(p, "ds_id") for p in model.parameters())
 
-    if gather_whole_model and not deepspeed_stage_3:
-        # DeepSpeed stage 3: gathering all params and broadcasting to vLLM inside
-        # GatheredParameters deadlocks intermittently (the exit collective races with
-        # rank 0's NCCL broadcasts on model_update_group). Use per-param gathering instead.
-        if isinstance(model, FSDP):
-            ctx = FSDP.summon_full_params(model, writeback=False, rank0_only=False)
-        else:
-            ctx = contextlib.nullcontext()
+    if isinstance(model, FSDP):
+        batches = [(FSDP.summon_full_params(model, writeback=False, rank0_only=False), params)]
+    elif gather_whole_model:
+        batches = [(deepspeed.zero.GatheredParameters(model.parameters(), enabled=deepspeed_stage_3), params)]
+    else:
+        batches = [
+            (deepspeed.zero.GatheredParameters([param], enabled=deepspeed_stage_3), [(name, param)])
+            for name, param in params
+        ]
+
+    for ctx, batch_params in batches:
         with ctx:
             if is_rank_0:
-                return _broadcast_params_to_vllm(params, vllm_engines, model_update_group, name_mapper)
-            return []
-    else:
-        if is_rank_0:
-            param_metadata = []
-            for name, param in params:
-                mapped_name = name_mapper(name) if name_mapper else name
-                shape = tuple(getattr(param, "ds_shape", param.shape))
-                param_metadata.append((mapped_name, str(param.dtype), shape))
-            all_refs = [engine.update_weights_batch.remote(param_metadata) for engine in vllm_engines]
-        else:
-            all_refs = []
-        for _name, param in params:
-            with deepspeed.zero.GatheredParameters([param], enabled=deepspeed_stage_3):
-                if is_rank_0:
-                    torch.distributed.broadcast(param.data, 0, group=model_update_group)
-        return all_refs
+                mapped_params = _prepare_params_for_sync(batch_params, name_mapper)
+                NCCLWeightTransferEngine.trainer_send_weights(iterator=iter(mapped_params), trainer_args=trainer_args)
+    return refs

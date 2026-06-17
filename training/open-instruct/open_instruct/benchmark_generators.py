@@ -247,6 +247,7 @@ def setup_vllm_engines(
         tensor_parallel_size=vllm_config.vllm_tensor_parallel_size,
         enforce_eager=vllm_config.vllm_enforce_eager,
         vllm_attention_backend=vllm_config.vllm_attention_backend,
+        vllm_gdn_prefill_backend=vllm_config.vllm_gdn_prefill_backend,
         tokenizer_name_or_path=tokenizer_name_or_path,
         pretrain=model_config.model_name_or_path,
         revision=model_config.model_revision,
@@ -263,6 +264,7 @@ def setup_vllm_engines(
         results_queue=inference_results_Q,
         actor_manager=actor_manager,
         inflight_updates=streaming_config.inflight_updates,
+        inflight_updates_recompute_kv_cache=streaming_config.inflight_updates_recompute_kv_cache,
         reward_config=RewardConfig(
             apply_verifiable_reward=streaming_config.apply_verifiable_reward,
             verification_reward=streaming_config.verification_reward,

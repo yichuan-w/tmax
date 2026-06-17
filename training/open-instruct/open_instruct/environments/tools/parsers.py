@@ -28,6 +28,14 @@ from open_instruct.utils import import_class_from_string
 logger = setup_logger(__name__)
 
 
+@dataclass
+class ToolCallParseResult:
+    """Parsed tool calls plus whether the model attempted any tool call."""
+
+    tool_calls: list[EnvCall] = field(default_factory=list)
+    had_tool_call: bool = False
+
+
 class ToolParser(ABC):
     """Base class for tool parsers."""
 
@@ -38,6 +46,11 @@ class ToolParser(ABC):
     def get_tool_calls(self, text: str) -> list[EnvCall]:
         """Extract tool calls from model outputs."""
         pass
+
+    def parse_tool_calls(self, text: str) -> "ToolCallParseResult":
+        """Extract valid tool calls and any malformed tool-call ids."""
+        tool_calls = self.get_tool_calls(text)
+        return ToolCallParseResult(tool_calls=tool_calls, had_tool_call=bool(tool_calls))
 
     @abstractmethod
     def format_tool_outputs(self, tool_outputs: list[str], role: str = "tool") -> str:
@@ -154,11 +167,15 @@ class VllmToolParser(ToolParser):
         Returns:
             List of EnvCall objects extracted from the text.
         """
+        return self.parse_tool_calls(text).tool_calls
+
+    def parse_tool_calls(self, text: str) -> ToolCallParseResult:
+        """Extract valid tool calls and record whether any tool call was attempted."""
         request = self._make_request()
         result = self.tool_parser.extract_tool_calls(model_output=text, request=request)
 
         if not result.tools_called:
-            return []
+            return ToolCallParseResult()
 
         tool_calls = []
         for call in result.tool_calls:
@@ -171,15 +188,15 @@ class VllmToolParser(ToolParser):
                 logger.warning(
                     f"VllmToolParser: Failed to parse tool arguments: {e}\nArguments: {call.function.arguments!r}"
                 )
-                continue
-        return tool_calls
+        return ToolCallParseResult(tool_calls=tool_calls, had_tool_call=True)
 
     def _format_tool_output(self, tool_output: str, role: str = "tool") -> str:
         template = self._role_templates[role]
         return template.format(output=tool_output)
 
     def format_tool_outputs(self, tool_outputs: list[str], role: str = "tool") -> str:
-        return f"{self._output_prefix}{''.join(self._format_tool_output(output, role) for output in tool_outputs)}{self._output_postfix}"
+        outputs = (self._format_tool_output(output, role) for output in tool_outputs)
+        return f"{self._output_prefix}{''.join(outputs)}{self._output_postfix}"
 
 
 @dataclass
@@ -239,23 +256,14 @@ VLLM_PARSERS: dict[str, VllmParserConfig] = {
         },
         output_postfix="<|im_start|>assistant\n",
     ),
-    # Qwen3 Coder-style tool calling (sentinel tokens: <tool_call>, <function=>, <parameter=>)
-    "vllm_qwen3_coder": VllmParserConfig(
-        import_path="vllm.tool_parsers.qwen3coder_tool_parser:Qwen3CoderToolParser",
-        role_templates={
-            "tool": "<|im_start|>tool\n{output}<|im_end|>\n",
-            "user": "<|im_start|>user\n{output}<|im_end|>\n",
-        },
-        output_postfix="<|im_start|>assistant\n",
-    ),
-    # Qwen3.5 XML-style tool calling
+    # Qwen 3.5
     "vllm_qwen3_xml": VllmParserConfig(
         import_path="vllm.tool_parsers.qwen3xml_tool_parser:Qwen3XMLToolParser",
         role_templates={
-            "tool": "<|im_start|>tool\n{output}<|im_end|>\n",
+            "tool": "<|im_start|>user\n<tool_response>\n{output}\n</tool_response>\n<|im_end|>\n",
             "user": "<|im_start|>user\n{output}<|im_end|>\n",
         },
-        output_postfix="<|im_start|>assistant\n",
+        output_postfix="<|im_start|>assistant\n<think>\n",
     ),
 }
 

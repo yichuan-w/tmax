@@ -1533,6 +1533,10 @@ def get_optimizer_grouped_parameters(
             "weight_decay": 0.0,
         },
     ]
+
+    # Filter empty groups to avoid issues with torch 2.10 and deepspeed
+    optimizer_grouped_parameters = [group for group in optimizer_grouped_parameters if group["params"]]
+
     return optimizer_grouped_parameters
 
 
@@ -1850,7 +1854,7 @@ class ModelDims:
         if self.device_name is None and torch.cuda.is_available():
             self.device_name = get_device_name(torch.cuda.get_device_name(0))
 
-        assert self.hidden_size % self.num_attn_heads == 0, "hidden_size must be divisible by num_attn_heads"
+        assert self.head_dim > 0, "head_dim must be positive"
         assert self.num_attn_heads % self.num_kv_heads == 0, (
             "num_attn_heads must be divisible by num_kv_heads (GQA/MQA)"
         )
@@ -1889,7 +1893,10 @@ class ModelDims:
                 num_sliding_window_layers = layer_types.count("sliding_attention")
             else:
                 num_sliding_window_layers = config.num_hidden_layers
-        head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            assert hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+            head_dim = hidden_size // config.num_attention_heads
         return cls(
             num_layers=config.num_hidden_layers,
             hidden_size=hidden_size,
@@ -2636,17 +2643,44 @@ class UlyssesSPSplitter:
         # slice and pad tensors for this sp rank
         kwargs = {}
         for field in dataclasses.fields(data):
+            # global_position_ids is preserved pre-slicing below; skip regular processing.
+            if field.name == "global_position_ids":
+                continue
             if field.name == "query_responses":
                 pad_value = self.pad_token_id
             elif field.name == "vllm_logprobs":
                 pad_value = INVALID_LOGPROB
+            elif field.name == "rollout_sample_ids":
+                pad_value = -1
             else:
                 pad_value = 0
+            val = getattr(data, field.name)
+            if val is None:
+                kwargs[field.name] = None
+                continue
             sharded = []
-            for t in getattr(data, field.name):
+            for t in val:
+                pad_len = max_seqlen - t.shape[-1]
+                if pad_len > 0 and field.name == "position_ids":
+                    # Pad position_ids with a large non-zero value so that padding
+                    # tokens are not mistaken for sub-sequence starts (pos_id == 0)
+                    # by _compute_packing_kwargs / build_fla_cp_context_for_sample.
+                    # A spurious pos_id=0 at rank 1 would create a false causal_conv1d
+                    # reset that corrupts the SSM state for all preceding tokens.
+                    pos_pad_value = int(t[0, -1].item()) + 1
+                    padded = F.pad(t, (0, pad_len), value=pos_pad_value)
+                else:
+                    padded = F.pad(t, (0, pad_len), value=pad_value)
                 # For all tensors in batch, pad tensor to max_seqlen, then slice to get this SP rank's chunk
-                padded_sliced = F.pad(t, (0, max_seqlen - t.shape[-1]), value=pad_value)[:, start_idx:end_idx]
+                padded_sliced = padded[:, start_idx:end_idx]
                 sharded.append(padded_sliced)
             kwargs[field.name] = sharded
+
+        # Stash UN-sharded (and UN-padded) position_ids per sample so the
+        # Qwen3.5 linear-attention packing patch can build an FLA CP context
+        # from the *global* cu_seqlens (pre-Ulysses partition).  Combined with
+        # the rank's (sp_rank, sp_world_size, chunk_len = max_seqlen // sp_world_size),
+        # this is enough to call ``fla.ops.cp.build_cp_context`` correctly.
+        kwargs["global_position_ids"] = [t.clone() for t in data.position_ids]
 
         return data_types.CollatedBatchData(**kwargs)

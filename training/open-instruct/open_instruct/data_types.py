@@ -59,6 +59,7 @@ class GenerationResult:
     reward_scores: list[float] | None = None
     reward_metrics: dict[str, Any] | None = None
     model_step: int | None = None
+    model_steps: list[int | None] | None = None
 
 
 @dataclass
@@ -96,6 +97,9 @@ class PromptRequest:
     active_tools: list[str] | None = None
     """List of tool names that are active for this sample. If None, all tools are active."""
     env_config: EnvConfig = field(default_factory=EnvConfig)
+    ground_truth: Any = None
+    """Optional ground truth override (e.g. from evolving rubrics). When set, the vLLM
+    engine uses this instead of looking up the ground truth from the dataset."""
 
 
 @dataclass
@@ -108,18 +112,34 @@ class CollatedBatchData:
     advantages: list[torch.Tensor]
     response_masks: list[torch.Tensor]
     vllm_logprobs: list[torch.Tensor]
+    rewards: list[torch.Tensor] | None = None
+    """Per-token reward tensor aligned with query_responses. Populated when PPO value training is enabled."""
+    dones: list[torch.Tensor] | None = None
+    """Per-token done markers aligned with query_responses. Populated when PPO value training is enabled."""
+    prompt_masks: list[torch.Tensor] | None = None
+    rollout_sample_ids: list[torch.Tensor] | None = None
+    model_steps: list[torch.Tensor] | None = None
+    # Pre-Ulysses-split ``position_ids`` for each sample. Only populated when
+    # ``sequence_parallel_size > 1``; lets downstream code (the Qwen3.5 packing
+    # patch + FLA CP context) reconstruct the global ``cu_seqlens`` so that
+    # sub-sequences that don't cross rank boundaries are correctly started
+    # from zero recurrent state.
+    global_position_ids: list[torch.Tensor] | None = None
 
     def __getitem__(self, idx: int | slice) -> "CollatedBatchData":
-        return CollatedBatchData(**{f.name: getattr(self, f.name)[idx] for f in dataclasses.fields(self)})
+        result: dict[str, Any] = {}
+        for f in dataclasses.fields(self):
+            val = getattr(self, f.name)
+            result[f.name] = None if val is None else val[idx]
+        return CollatedBatchData(**result)
 
     def __len__(self) -> int:
         return len(self.query_responses)
 
     def to(self, device: torch.device, non_blocking: bool = True) -> "CollatedBatchData":
-        return dataclasses.replace(
-            self,
-            **{
-                f.name: [t.to(device, non_blocking=non_blocking) for t in getattr(self, f.name)]
-                for f in dataclasses.fields(self)
-            },
-        )
+        def move(val: Any) -> Any:
+            if val is None:
+                return None
+            return [t.to(device, non_blocking=non_blocking) for t in val]
+
+        return dataclasses.replace(self, **{f.name: move(getattr(self, f.name)) for f in dataclasses.fields(self)})

@@ -251,13 +251,10 @@ class PreferenceDatasetProcessor(DatasetProcessor):
                 len(row[INPUT_IDS_PROMPT_KEY]) <= self.config.max_prompt_token_length
                 if self.config.max_prompt_token_length is not None
                 else (
-                    True and len(row[INPUT_IDS_CHOSEN_KEY]) <= self.config.max_token_length
+                    len(row[INPUT_IDS_CHOSEN_KEY]) <= self.config.max_token_length
+                    and len(row[INPUT_IDS_REJECTED_KEY]) <= self.config.max_token_length
                     if self.config.max_token_length is not None
-                    else (
-                        True and len(row[INPUT_IDS_REJECTED_KEY]) <= self.config.max_token_length
-                        if self.config.max_token_length is not None
-                        else True
-                    )
+                    else True
                 )
             )
 
@@ -282,8 +279,11 @@ class SFTDatasetProcessor(DatasetProcessor):
                 prompt = row[self.config.sft_messages_key]
             else:
                 prompt = row[self.config.sft_messages_key][:-1]
-            row[INPUT_IDS_PROMPT_KEY] = self.tokenizer.apply_chat_template(prompt, add_generation_prompt=True)
-            row[INPUT_IDS_KEY] = self.tokenizer.apply_chat_template(row[self.config.sft_messages_key])
+            tools = row.get("tools") or None
+            row[INPUT_IDS_PROMPT_KEY] = self.tokenizer.apply_chat_template(
+                prompt, tools=tools, add_generation_prompt=True
+            )
+            row[INPUT_IDS_KEY] = self.tokenizer.apply_chat_template(row[self.config.sft_messages_key], tools=tools)
             row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
             labels = copy.deepcopy(row[INPUT_IDS_KEY])
             if self.config.train_only_on_prompt:
@@ -291,12 +291,15 @@ class SFTDatasetProcessor(DatasetProcessor):
             row[LABELS_KEY] = labels
             return row
 
-        return dataset.map(
+        dataset = dataset.map(
             tokenize_fn,
             num_proc=get_num_proc(len(dataset), self.config.num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
             load_from_cache_file=self.config.load_from_cache_file,
             desc="Tokenizing and reformatting SFT data",
         )
+        if "tools" in dataset.column_names:
+            dataset = dataset.remove_columns(["tools"])
+        return dataset
 
     def filter(self, dataset: Dataset, need_contain_labels: bool = True):  # type: ignore[override]
         def filter_fn(row):
@@ -328,8 +331,11 @@ class SFTGroundTruthDatasetProcessor(DatasetProcessor):
                 prompt = row[self.config.sft_messages_key]
             else:
                 prompt = row[self.config.sft_messages_key][:-1]
-            row[INPUT_IDS_PROMPT_KEY] = self.tokenizer.apply_chat_template(prompt, add_generation_prompt=True)
-            row[INPUT_IDS_KEY] = self.tokenizer.apply_chat_template(row[self.config.sft_messages_key])
+            tools = row.get("tools") or None
+            row[INPUT_IDS_PROMPT_KEY] = self.tokenizer.apply_chat_template(
+                prompt, tools=tools, add_generation_prompt=True
+            )
+            row[INPUT_IDS_KEY] = self.tokenizer.apply_chat_template(row[self.config.sft_messages_key], tools=tools)
             row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
             labels = copy.deepcopy(row[INPUT_IDS_KEY])
             if self.config.train_only_on_prompt:
@@ -339,12 +345,15 @@ class SFTGroundTruthDatasetProcessor(DatasetProcessor):
             row[VERIFIER_SOURCE_KEY] = row[self.config.dataset_source_key]
             return row
 
-        return dataset.map(
+        dataset = dataset.map(
             tokenize_fn,
             num_proc=get_num_proc(len(dataset), self.config.num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
             load_from_cache_file=self.config.load_from_cache_file,
             desc="Tokenizing and reformatting SFT data",
         )
+        if "tools" in dataset.column_names:
+            dataset = dataset.remove_columns(["tools"])
+        return dataset
 
     def filter(self, dataset: Dataset, need_contain_labels: bool = True):  # type: ignore[override]
         def filter_fn(row):

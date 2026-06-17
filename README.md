@@ -3,58 +3,38 @@
 </p>
 
 <p align="center">
-  <em>Data generation and evaluation for terminal-using agents.</em>
+  <em>Simple terminal-using agents.</em>
 </p>
 
 <p align="center">
-  <a href="#whats-here">Overview</a> ·
-  <a href="#repository-layout">Layout</a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#requirements">Requirements</a>
+  💻 <a href="https://github.com/hamishivi/tmax">Code</a> ·
+  🤗 <a href="https://huggingface.co/collections/allenai/tmax">Models &amp; Data</a> ·
+  📜 <a href="#">Paper</a> <!-- TODO: add paper link -->
 </p>
 
 ---
 
-**TMax** is the research codebase behind our work on training language models to
-act as capable terminal agents. It covers synthesising diverse,
-difficulty-aware terminal tasks, rolling them out with LLM agents to produce
-training data, and evaluating models on [Terminal-Bench](https://www.tbench.ai/)
-and friends. Everything runs on top of [Harbor](https://github.com/laude-institute/harbor)
-for sandboxed task execution and [LiteLLM](https://github.com/BerriAI/litellm)
-for model access.
+Todo: teaser figure
+
+Tmax is our project around training simple, powerful terminal using agents. This codebase covers data generation, training, and evaluation. Please refer to our [paper](https://arxiv.org/abs/xxx) for more details.
+
+Below, we give a quick overview of the codebase and how to use it.
+
+### News
+- Initial release of the codebase and models! Please read [our paper](https://arxiv.org/abs/xxx) for more details.
+
+
 
 ## What's here
 
-| Component | What it does |
-|-----------|--------------|
-| **`rl_data/`** | A simple, scalable, diverse, difficulty-aware pipeline for synthesising terminal-agent tasks, solving them at pass@k, analysing the corpus, and publishing it to the Hugging Face Hub. Tasks are sampled as an *independent product of structured axes* and packaged as self-contained Apptainer/Docker environments with programmatic verifiers. |
-| **`Vanillux2Agent/`** | The Harbor agent used for solving and evaluation: a direct LiteLLM agent built on the vanillux prompt harness (mini-SWE-agent-derived prompts, bash tool schema, submit marker, format-error recovery, and output truncation), executing commands through Harbor's active environment. |
-| **`training/open-instruct/`** | A fork of [open-instruct](https://github.com/allenai/open-instruct) with fixes for Qwen 3.5 and terminal-agent training. SFT and DPPO RL launch scripts for the tmax models live under `training/open-instruct/scripts/tmax/`. |
-| **`scripts/` + `beaker_configs/`** | Evaluation infrastructure — shell/Slurm launchers and a Beaker pipeline that serves a model with vLLM and runs Harbor datasets (Terminal-Bench, TB-Lite, SWE-bench) against it. |
+The repo is organised around four stages of building a terminal agent:
 
-## Repository layout
-
-```
-tmax/
-├── rl_data/            # terminal task data generation pipeline (see rl_data/README.md)
-│   ├── generate_tasks.py       # sample axes → template → tests → container build+smoke
-│   ├── generate_solutions.py   # solve tasks with agents, collect pass@k
-│   ├── analyze.py              # composition / difficulty / balance stats + plots
-│   ├── generator/             # taxonomy, personas, fixtures, verifiers, solvers
-│   ├── comparison/            # composition/difficulty vs external baselines
-│   ├── decontamination/       # 13-gram overlap vs Terminal-Bench / TB-Lite
-│   └── scripts/               # thin launchers for every stage
-│
-├── Vanillux2Agent/     # Harbor agent (direct LiteLLM, vanillux prompt harness)
-│
-├── training/           # open-instruct fork for SFT + RL (see training/open-instruct/README.md)
-│   └── open-instruct/
-│       └── scripts/tmax/   # SFT/ and RL/ launch scripts for the tmax models
-│
-├── beaker_configs/     # Beaker launchers (launch_eval.sh, launch_vllm.sh)
-├── scripts/            # eval launchers (Terminal-Bench, TB-Lite, SWE-bench) + beaker pipeline
-└── pyproject.toml      # deps, pinned via uv.lock
-```
+| Stage | Where | What it does |
+|-------|-------|--------------|
+| **Data generation** | `rl_data/` | A simple, scalable, diverse, difficulty-aware pipeline for synthesising terminal-agent tasks, solving them at pass@k, analysing the corpus, and publishing it to the Hugging Face Hub. Tasks are sampled as an *independent product of structured axes* and packaged as self-contained Apptainer/Docker environments with programmatic verifiers. |
+| **Agent** | `Vanillux2Agent/` | The Harbor agent used for solving and evaluation: a direct LiteLLM agent built on the vanillux prompt harness (mini-SWE-agent-derived prompts, bash tool schema, submit marker, format-error recovery, and output truncation), executing commands through Harbor's active environment. |
+| **Training** | `training/open-instruct/` | A fork of [open-instruct](https://github.com/allenai/open-instruct) with fixes for Qwen 3.5 and terminal-agent training. SFT and DPPO RL launch scripts for the tmax models live under `training/open-instruct/scripts/tmax/`. |
+| **Evaluation** | `scripts/` + `beaker_configs/` | Shell/Slurm launchers and a Beaker pipeline that serves a model with vLLM and runs Harbor datasets (Terminal-Bench, TB-Lite, SWE-bench) against it. |
 
 ## Quickstart
 
@@ -118,7 +98,8 @@ pipeline, flags, and troubleshooting.
 - **[`uv`](https://github.com/astral-sh/uv)** for dependency management (deps pinned in `pyproject.toml` / `uv.lock`).
 - An **LLM API key** for the configured model (e.g. `GEMINI_API_KEY`); local
   vLLM / Ollama / OpenAI-compatible endpoints are also supported via env vars.
-- **`apptainer`** on PATH for building and running task containers.
+- (for data generation) **`apptainer`** on PATH for building and running task containers.
+- (for training) A **Dockerhub login** and personal access token (PAT). In particular, you probably need a business account to pull images from Dockerhub at large scale.
 - **`HF_TOKEN`** for the Hugging Face upload stage and for pulling gated models.
 
 ## Licensing

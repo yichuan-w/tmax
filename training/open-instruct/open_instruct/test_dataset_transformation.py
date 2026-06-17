@@ -1,10 +1,12 @@
 import gc
 import gzip
 import hashlib
+import json
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -84,6 +86,45 @@ class TestConfigHash(unittest.TestCase):
         hash1 = open_instruct.dataset_transformation.compute_config_hash(dcs1, tc)
         hash2 = open_instruct.dataset_transformation.compute_config_hash(dcs2, tc)
         self.assertNotEqual(hash1, hash2, "Different configs should have different hashes")
+
+    def test_load_dataset_configs_passes_hf_config_name(self):
+        dataset = open_instruct.dataset_transformation.Dataset.from_dict({"messages": [[]]})
+        with (
+            mock.patch("open_instruct.dataset_transformation.get_commit_hash", return_value="abc123"),
+            mock.patch("open_instruct.dataset_transformation.load_dataset", return_value=dataset) as load_dataset,
+        ):
+            dcs = open_instruct.dataset_transformation.load_dataset_configs(
+                dataset_mixer_list=["org/repo", "1.0"],
+                dataset_mixer_list_splits=["train"],
+                dataset_transform_fn=[],
+                transform_fn_args=[],
+                dataset_mixer_list_config_names=["named_config"],
+            )
+
+        self.assertEqual(dcs[0].dataset_config_name, "named_config")
+        load_dataset.assert_called_once()
+        args, kwargs = load_dataset.call_args
+        self.assertEqual(args[:2], ("org/repo", "named_config"))
+        self.assertEqual(kwargs["split"], "train")
+
+
+class TestToolNormalization(unittest.TestCase):
+    def test_normalize_tools_accepts_json_encoded_schema_list(self):
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute bash",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        tools = open_instruct.dataset_transformation._normalize_tools_for_chat_template(json.dumps([tool_schema]))
+
+        self.assertEqual(tools, [tool_schema])
+
+    def test_normalize_tools_rejects_tool_name_lists(self):
+        with self.assertRaises(TypeError):
+            open_instruct.dataset_transformation._normalize_tools_for_chat_template(["bash"])
 
 
 class TestCachedDataset(unittest.TestCase):

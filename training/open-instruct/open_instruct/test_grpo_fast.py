@@ -1,5 +1,7 @@
 import gc
+import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -22,6 +24,22 @@ from open_instruct.dataset_transformation import (
     RAW_PROMPT_KEY,
     VERIFIER_SOURCE_KEY,
 )
+
+
+class TestBatchMetrics(unittest.TestCase):
+    def test_compute_avg_group_performance(self):
+        avg_group_perf = data_loader_lib._compute_avg_group_performance(
+            n_solved=2, n_zero=3, n_kept=5, batch_avg_score=0.4
+        )
+
+        self.assertAlmostEqual(avg_group_perf, 0.4)
+
+    def test_compute_avg_group_performance_empty(self):
+        avg_group_perf = data_loader_lib._compute_avg_group_performance(
+            n_solved=0, n_zero=0, n_kept=0, batch_avg_score=0.4
+        )
+
+        self.assertEqual(avg_group_perf, 0.0)
 
 
 class TestGrpoFastBase(unittest.TestCase):
@@ -148,6 +166,9 @@ class TestGrpoFastBase(unittest.TestCase):
             attention_masks=[torch.ones(length, dtype=torch.long) for length in lengths],
             response_masks=[torch.ones(length, dtype=torch.long) for length in lengths],
             original_responses=[[i] * seq_length for i in range(batch_size)],
+            prompt_masks=[torch.zeros(length, dtype=torch.long) for length in lengths],
+            rollout_sample_ids=[torch.full((length,), i, dtype=torch.long) for i, length in enumerate(lengths)],
+            model_steps=[torch.full((length,), 3, dtype=torch.long) for length in lengths],
             advantages=[torch.randn(length) for length in lengths],
             position_ids=[torch.arange(length, dtype=torch.long) for length in lengths],
             vllm_logprobs=[torch.randn(length) for length in lengths],
@@ -526,6 +547,58 @@ class GrpoIntegrationTests(TestGrpoFastBase):
         self.assertEqual(reward_metrics["model_step_max"], 12.0)
         self.assertEqual(reward_metrics["model_step_mean"], 11.0)
 
+    def test_accumulate_inference_batches_drops_stale_model_steps(self):
+        num_prompts = 2
+        tokenizer, _ = self.create_mock_tokenizer_and_reward_fn()
+        inference_results_Q = ray_queue.Queue(maxsize=4)
+        prompt_Q = ray_queue.Queue(maxsize=4)
+        self._ray_queues.extend([inference_results_Q, prompt_Q])
+
+        queries, ground_truths, datasets, raw_queries, _ = self.create_test_data(3)
+        mock_dataset = self.create_mock_dataset(queries, ground_truths, datasets, raw_queries)
+
+        class FakeDataLoader:
+            _epoch = 0
+
+            def __init__(self, dataset):
+                self.dataset = dataset
+                self.index = 0
+
+            def __next__(self):
+                example = self.dataset[self.index % len(self.dataset)]
+                self.index += 1
+                return example
+
+        inference_results_Q.put(self.create_mock_result(0, "0_0", model_step=1))
+        inference_results_Q.put(self.create_mock_result(1, "0_1", model_step=8))
+        inference_results_Q.put(self.create_mock_result(2, "0_2", model_step=10))
+
+        mock_generation_config = Mock()
+        mock_generation_config.n = 1
+
+        mock_model_dims = self.create_llama7b_model_dims()
+        combined_result, batch, reward_metrics, _ = data_loader_lib.accumulate_inference_batches(
+            inference_results_Q,
+            mock_generation_config,
+            num_prompts=num_prompts,
+            model_dims=mock_model_dims,
+            tokenizer=tokenizer,
+            dataset=mock_dataset,
+            base_env_config=EnvConfig(),
+            replenish_prompts=True,
+            iter_dataloader=FakeDataLoader(mock_dataset),
+            param_prompt_Q=prompt_Q,
+            training_step=10,
+            max_result_age_steps=2,
+        )
+
+        self.assertEqual(batch.indices, [1, 2])
+        self.assertEqual(len(combined_result.responses), num_prompts)
+        self.assertEqual(prompt_Q.qsize(), 1)
+        self.assertEqual(reward_metrics["stale_results_dropped"], 1.0)
+        self.assertEqual(reward_metrics["model_step_min"], 8.0)
+        self.assertEqual(reward_metrics["model_step_max"], 10.0)
+
     @unittest.skip("Timing-sensitive test that is flaky in CI environments")
     def test_accumulate_waits_for_all_engines(self):
         """Test that accumulate_inference_batches waits for all engines."""
@@ -776,6 +849,65 @@ class TestAccumulateInferenceBatches(TestGrpoFastBase):
         self.assertIsNone(reward_metrics)
         self.assertIsNone(batch_stats)
 
+    def test_save_filtered_rollouts(self):
+        num_samples_per_prompt = 4
+        queries, ground_truths, datasets, raw_queries, _ = self.create_test_data(1)
+        inference_results_Q = ray_queue.Queue(maxsize=1)
+        self._ray_queues.append(inference_results_Q)
+        mock_dataset = self.create_mock_dataset(queries, ground_truths, datasets, raw_queries)
+        inference_results_Q.put(
+            self.create_mock_result(
+                0, "0_0", num_samples_per_prompt=num_samples_per_prompt, reward_scores=[0.0] * num_samples_per_prompt
+            )
+        )
+
+        mock_generation_config = Mock()
+        mock_generation_config.n = num_samples_per_prompt
+        tokenizer, _ = self.create_mock_tokenizer_and_reward_fn()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filtered_dir = os.path.join(tmpdir, "filtered")
+            result, batch, reward_metrics, batch_stats = data_loader_lib.accumulate_inference_batches(
+                inference_results_Q,
+                mock_generation_config,
+                num_prompts=1,
+                model_dims=self.create_llama7b_model_dims(),
+                tokenizer=tokenizer,
+                dataset=mock_dataset,
+                base_env_config=EnvConfig(),
+                filter_zero_std_samples=True,
+                save_filtered_rollouts=True,
+                filtered_rollouts_save_path=filtered_dir,
+                run_name="test_run",
+                training_step=7,
+            )
+
+            self.assertIsNone(result)
+            self.assertIsNone(batch)
+            self.assertIsNone(reward_metrics)
+            self.assertIsNone(batch_stats)
+
+            output_file = os.path.join(filtered_dir, "test_run_filtered_rollouts_000000.jsonl")
+            deadline = time.time() + 5
+            records = []
+            while time.time() < deadline:
+                if os.path.exists(output_file):
+                    with open(output_file) as f:
+                        records = [json.loads(line) for line in f]
+                    if len(records) == num_samples_per_prompt:
+                        break
+                time.sleep(0.01)
+
+            self.assertTrue(os.path.exists(output_file))
+            self.assertEqual(len(records), num_samples_per_prompt)
+
+        self.assertEqual({record["filter_reason"] for record in records}, {"zero_std_reward"})
+        self.assertEqual({record["step"] for record in records}, {7})
+        self.assertEqual({record["prompt_id"] for record in records}, {"0_0"})
+        self.assertEqual({record["dataset_index"] for record in records}, {0})
+        self.assertEqual({record["reward"] for record in records}, {0.0})
+        self.assertTrue(all(record["decoded_response"] is not None for record in records))
+
 
 class TestDataPreparation(TestGrpoFastBase):
     """Test prepare_collated_data_for_workers function."""
@@ -809,8 +941,13 @@ class TestDataPreparation(TestGrpoFastBase):
             "position_ids",
             "advantages",
             "response_masks",
+            "prompt_masks",
+            "rollout_sample_ids",
+            "model_steps",
             "vllm_logprobs",
+            "global_position_ids",
         }
+        tensor_fields = expected_fields - {"global_position_ids"}
 
         expected_samples_per_worker = batch_size // world_size
         expected_num_microbatches = (
@@ -825,8 +962,9 @@ class TestDataPreparation(TestGrpoFastBase):
 
             num_microbatches = len(worker_data.query_responses)
             self.assertEqual(num_microbatches, expected_num_microbatches)
+            self.assertIsNone(worker_data.global_position_ids)
 
-            for field_name in expected_fields:
+            for field_name in tensor_fields:
                 value = getattr(worker_data, field_name)
                 self.assertIsInstance(value, list)
                 self.assertEqual(len(value), expected_num_microbatches)

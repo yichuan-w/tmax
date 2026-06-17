@@ -37,13 +37,18 @@ from datetime import timedelta
 os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
 with contextlib.suppress(Exception):
     import deepspeed
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
     from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
     from deepspeed.utils import groups
+
+with contextlib.suppress(Exception):
+    pass
 
 from open_instruct import data_loader as data_loader_lib
 from open_instruct import data_types, grpo_utils, utils
 from open_instruct.data_loader import accumulate_inference_batches, add_prompt_to_generator
 from open_instruct.data_types import EnvConfig, EnvConfigEntry
+from open_instruct.rubrics.evolving_rubric_step import RUBRIC_TABLE_COLUMNS, RUBRIC_TABLE_KEY
 
 # isort: on
 import asyncio
@@ -52,7 +57,6 @@ import logging
 import math
 import random
 import shutil
-import socket
 import threading
 import time
 from dataclasses import asdict
@@ -78,8 +82,10 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from rich.pretty import pprint
 from transformers import AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer, get_scheduler
 from transformers.integrations import HfDeepSpeedConfig
+from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
+from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
-from open_instruct import logger_utils, model_utils, vllm_utils
+from open_instruct import logger_utils, model_utils, rl_utils, value_model_utils, vllm_utils
 from open_instruct.actor_manager import ActorManager
 from open_instruct.data_types import ShutdownSentinel
 from open_instruct.dataset_transformation import (
@@ -106,7 +112,11 @@ from open_instruct.model_utils import (
     print_rich_table,
     push_folder_to_hub,
 )
-from open_instruct.qwen3_5_packing_patch import patch_qwen3_5_packing
+from open_instruct.qwen3_5_packing_patch import (
+    patch_hf_lm_head_fp32,
+    patch_qwen3_5_packing,
+    register_qwen3_5_zero3_external_parameters,
+)
 from open_instruct.rl_utils import Timer, masked_mean
 from open_instruct.utils import (
     ArgumentParserPlus,
@@ -130,6 +140,15 @@ from open_instruct.utils import (
 )
 
 logger = logger_utils.setup_logger(__name__)
+
+
+def _count_sampled_episodes_for_step(
+    streaming_config: data_loader_lib.StreamingDataLoaderConfig, step_metrics: dict[str, Any]
+) -> int:
+    sampled_prompt_groups = streaming_config.num_unique_prompts_rollout
+    if streaming_config.active_sampling:
+        sampled_prompt_groups += int(step_metrics.get("batch/filtered_prompts", 0))
+    return sampled_prompt_groups * streaming_config.num_samples_per_prompt_rollout
 
 
 def _build_data_prep_actor_resume_state(checkpoint_state: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -164,8 +183,8 @@ EXCLUDED_ENV_VARS = {"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"}
 
 def _build_vlm_name_mapper(model_name: str):
     """Sometimes we have different weight names btw vLLM and HF, so we build
-    a mapping. E.g., Qwen3.5 has 'language_model.' prefixed in vLLM but not HF."""
-    if "qwen3.5" in model_name.lower():
+    a mapping. E.g., Qwen3.5/3.6 have 'language_model.' prefixed in vLLM but not HF."""
+    if any(qwen_version in model_name.lower() for qwen_version in ("qwen3.5", "qwen3.6")):
         return lambda name: f"language_model.{name}"
     return None
 
@@ -225,6 +244,11 @@ class PolicyTrainerRayProcess(RayProcess):
         torch_checkpoint_engine.TorchCheckpointEngine.load = load
 
         # ------------------------------------------------------------
+        # Patch Qwen3.5 GatedDeltaNet to support packing in THIS worker process.
+        # The call in main() only patches the main process; Ray workers are
+        # separate processes and need the patch applied here before the model loads.
+        patch_qwen3_5_packing()
+        # ------------------------------------------------------------
         self.args = args
         self.tokenizer = tokenizer
         self.model_config = model_config
@@ -253,6 +277,7 @@ class PolicyTrainerRayProcess(RayProcess):
             adam_offload=args.deepspeed_offload_optimizer,
             stage=args.deepspeed_stage,
             bf16=True,
+            max_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
             zpg=args.deepspeed_zpg,
             sequence_parallel_size=args.sequence_parallel_size,
         )
@@ -288,6 +313,8 @@ class PolicyTrainerRayProcess(RayProcess):
         self.policy.config.use_cache = False
         disable_dropout_in_model(self.policy)
         self.policy.gradient_checkpointing_enable()
+        if args.use_liger_grpo_loss:
+            logger.info("Using Open Instruct tiled GRPO lm-head loss.")
         if args.set_weight_decay_on_bias_and_norm:
             optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
         else:
@@ -311,6 +338,7 @@ class PolicyTrainerRayProcess(RayProcess):
         )
         optimization_steps_done = 0
         checkpoint_state = None
+        self.value_model_checkpoint_path = None
         if args.checkpoint_state_dir:
             # check if the dir exists
             if not os.path.exists(args.checkpoint_state_dir):
@@ -331,6 +359,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 self.model.mpu = old_mpu
                 if path is None:
                     raise ValueError(f"Failed to load checkpoint from {args.checkpoint_state_dir}")
+
                 checkpoint_state = states
                 optimization_steps_done = states["training_step"]
 
@@ -358,9 +387,24 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.ref_policy_checkpoint_path = model_path
                         logger.info(f"{self.rank=}: Will load reference policy from {model_path}")
 
+                if args.use_value_model:
+                    value_model_dir = os.path.join(args.checkpoint_state_dir, "value_model")
+                    if os.path.exists(os.path.join(value_model_dir, "value_model.bin")):
+                        self.value_model_checkpoint_path = value_model_dir
+                        logger.info(f"{self.rank=}: Will load value model from {value_model_dir}")
+                    elif states.get("value_model_saved", False):
+                        logger.warning(
+                            f"{self.rank=}: Checkpoint state says value model was saved, but no file was found at {value_model_dir}"
+                        )
+
                 logger.info(
                     f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
                 )
+        register_qwen3_5_zero3_external_parameters(self.model)
+        if args.lm_head_fp32:
+            # Apply after checkpoint loading so the wrapper sees the final ZeRO-3
+            # parameter objects/statuses restored by DeepSpeed.
+            patch_hf_lm_head_fp32(self.model)
         self.model.train()
 
         # reference model
@@ -388,18 +432,45 @@ class PolicyTrainerRayProcess(RayProcess):
                 ref_policy_update_freq=args.ref_policy_update_freq,
                 alpha=args.alpha,
             )
+            register_qwen3_5_zero3_external_parameters(self.ref_policy)
+            if args.lm_head_fp32:
+                patch_hf_lm_head_fp32(self.ref_policy)
         self.local_metrics = utils.MetricsTracker(max_metrics=512, device=self.device)
+        self.value_model = None
+        if args.use_value_model:
+            self._init_value_model(args, model_config)
 
         if self.mpu is not None:
+            sp_rank = groups._get_sequence_parallel_rank()
+            sp_group = groups._get_sequence_parallel_group()
+            sp_world_size = groups._get_sequence_parallel_world_size()
             self.splitter = UlyssesSPSplitter(
-                sp_rank=groups._get_sequence_parallel_rank(),
-                sp_group=groups._get_sequence_parallel_group(),
-                sp_world_size=groups._get_sequence_parallel_world_size(),
+                sp_rank=sp_rank,
+                sp_group=sp_group,
+                sp_world_size=sp_world_size,
                 device=self.device,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
+            # Retain SP metadata so we can build a fresh FLA CP context per
+            # sample (via ``build_fla_cp_context_for_sample``).  We no longer
+            # use a static FLACPContext because the manual construction
+            # incorrectly assumes every rank is in the middle of one global
+            # sub-sequence, which is false for packed RL batches with
+            # multiple rollouts per row.
+            self._sp_rank = sp_rank
+            self._sp_group = sp_group
+            self._sp_world_size = sp_world_size
+            self._conv_kernel_size = getattr(self.policy.config, "linear_conv_kernel_dim", None) or getattr(
+                getattr(self.policy.config, "text_config", None), "linear_conv_kernel_dim", None
+            )
+            self.cp_context = None  # per-sample; built in the training loop
         else:
             self.splitter = None
+            self.cp_context = None
+            self._sp_rank = 0
+            self._sp_group = None
+            self._sp_world_size = 1
+            self._conv_kernel_size = None
 
         # dp_rank = which data-parallel group this worker belongs to
         # With SP, workers in the same SP group share the same dp_rank
@@ -426,43 +497,208 @@ class PolicyTrainerRayProcess(RayProcess):
 
         return {"optimization_steps_done": optimization_steps_done, "checkpoint_state": checkpoint_state}
 
+    def _init_value_model(self, args: grpo_utils.GRPOExperimentConfig, model_config: ModelConfig) -> None:
+        """Initialize an independent scalar value model for PPO-style training."""
+        logger.info(f"{self.rank=}: Initializing value model")
+
+        import transformers.integrations.deepspeed as _hf_ds_integration  # noqa: PLC0415
+
+        saved_ds_config = _hf_ds_integration._hf_deepspeed_config_weak_ref
+        _hf_ds_integration._hf_deepspeed_config_weak_ref = None
+        try:
+            value_model_path = args.value_model_name_or_path or model_config.model_name_or_path
+            value_revision = (
+                model_config.model_revision
+                if args.value_model_name_or_path is None
+                or args.value_model_name_or_path == model_config.model_name_or_path
+                else None
+            )
+            hf_attn = model_utils.olmo_core_attn_to_hf(model_config.attn_implementation)
+
+            self.value_model = AutoModelForCausalLM.from_pretrained(
+                value_model_path,
+                revision=value_revision,
+                dtype=torch.bfloat16,
+                attn_implementation=hf_attn,
+                local_files_only=True,
+                **({"device_map": {"": self.local_rank}} if args.deepspeed_stage != 3 else {}),
+            )
+            self.value_model.config.use_cache = False
+            hidden_size = self.value_model.config.hidden_size
+            value_head = torch.nn.Linear(hidden_size, 1, bias=False, dtype=torch.bfloat16)
+            torch.nn.init.normal_(value_head.weight, mean=0.0, std=1.0 / (hidden_size + 1) ** 0.5)
+            self.value_model.lm_head = value_head
+        finally:
+            _hf_ds_integration._hf_deepspeed_config_weak_ref = saved_ds_config
+
+        disable_dropout_in_model(self.value_model)
+
+        if self.value_model_checkpoint_path is not None:
+            model_file = os.path.join(self.value_model_checkpoint_path, "value_model.bin")
+            state_dict = torch.load(model_file, map_location=self.device, weights_only=True)
+            self.value_model.load_state_dict(state_dict)
+            logger.info(f"{self.rank=}: Loaded value model weights from checkpoint {model_file}")
+
+        value_ds_config = get_train_ds_config(
+            offload=args.deepspeed_offload_param,
+            adam_offload=args.deepspeed_offload_optimizer,
+            stage=args.deepspeed_stage,
+            bf16=True,
+            max_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
+            zpg=args.deepspeed_zpg,
+            sequence_parallel_size=args.sequence_parallel_size,
+        )
+        value_ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+        value_ds_config["gradient_accumulation_steps"] = 1
+
+        value_lr = args.value_learning_rate if args.value_learning_rate is not None else args.learning_rate
+        if args.set_weight_decay_on_bias_and_norm:
+            value_optim_params = get_optimizer_grouped_parameters(self.value_model, args.weight_decay)
+        else:
+            value_optim_params = self.value_model.parameters()
+        if args.deepspeed_offload_optimizer:
+            self.value_optimizer = DeepSpeedCPUAdam(value_optim_params, lr=value_lr)
+        else:
+            self.value_optimizer = torch.optim.AdamW(value_optim_params, lr=value_lr, fused=args.fused_optimizer)
+
+        self._value_effective_mini_batches = (
+            args.value_num_mini_batches if args.value_num_mini_batches is not None else args.num_mini_batches
+        )
+        num_value_scheduler_steps = args.num_training_steps * args.num_epochs * self._value_effective_mini_batches
+        value_scheduler = get_scheduler(
+            args.lr_scheduler_type,
+            optimizer=self.value_optimizer,
+            num_warmup_steps=int(num_value_scheduler_steps * args.warmup_ratio),
+            num_training_steps=num_value_scheduler_steps,
+        )
+
+        self.value_model, self.value_optimizer, _, self.value_scheduler = deepspeed.initialize(
+            model=self.value_model,
+            optimizer=self.value_optimizer,
+            config=value_ds_config,
+            lr_scheduler=value_scheduler,
+            dist_init_required=False,
+            mpu=self.mpu,
+        )
+
+        unwrapped = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
+        if model_config.gradient_checkpointing and hasattr(unwrapped, "gradient_checkpointing_enable"):
+            unwrapped.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        self.value_model.train()
+        logger.info(
+            f"{self.rank=}: Value model ready (lr={value_lr}, mini_batches={self._value_effective_mini_batches})"
+        )
+
+    @staticmethod
+    def _align_value_predictions(values: torch.Tensor, target_shape: torch.Size, context: str) -> torch.Tensor:
+        if values.shape == target_shape:
+            return values
+        if values.ndim != len(target_shape):
+            raise ValueError(f"{context}: expected {target_shape}, got {tuple(values.shape)}")
+        aligned = values
+        for dim, target in enumerate(target_shape):
+            current = aligned.shape[dim]
+            if current > target:
+                slices = [slice(None)] * aligned.ndim
+                slices[dim] = slice(0, target)
+                aligned = aligned[tuple(slices)]
+            elif current < target:
+                pad_shape = list(aligned.shape)
+                pad_shape[dim] = target - current
+                pad = aligned.new_zeros(pad_shape)
+                aligned = torch.cat([aligned, pad], dim=dim)
+        return aligned
+
+    def forward_value(
+        self, query_responses: torch.Tensor, position_ids: torch.Tensor, response_mask: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.value_model is not None, "value_model is not initialized"
+        output = self.value_model(input_ids=query_responses, position_ids=position_ids)
+        logits = getattr(output, "logits", output)[:, :-1]
+        values = logits.squeeze(-1).float()
+        values = self._align_value_predictions(values, response_mask.shape, "forward_value")
+        return torch.where(response_mask, values, torch.zeros_like(values))
+
+    def _dummy_value_forward(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        dummy = torch.zeros(1, 1, dtype=dtype, device=device)
+        output = self.value_model(input_ids=dummy, attention_mask=dummy, position_ids=dummy)
+        logits = getattr(output, "logits", output)
+        return logits.reshape(-1)[0]
+
+    def _dispatch_gae(
+        self, values_np: np.ndarray, rewards_np: np.ndarray, dones_np: np.ndarray, response_masks_np: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return rl_utils.calculate_advantages_packed(
+            values=values_np,
+            rewards=rewards_np,
+            gamma=self.args.gamma,
+            lam=self.args.gae_lambda,
+            dones=dones_np,
+            response_masks=response_masks_np,
+        )
+
     def setup_model_update_group(self, vllm_engines):
         self.vllm_engines = vllm_engines
         self.model_update_group = None
         if self.rank == 0:
-            master_address = ray._private.services.get_node_ip_address()
-            with socket.socket() as sock:
-                sock.bind(("", 0))
-                master_port = sock.getsockname()[1]
-            vllm_num_engines, vllm_tensor_parallel_size = (
-                self.vllm_config.vllm_num_engines,
-                self.vllm_config.vllm_tensor_parallel_size,
-            )
-            world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
-            backend = self.vllm_config.vllm_sync_backend
-            refs = [
-                engine.init_process_group.remote(
-                    master_address,
-                    master_port,
-                    i * vllm_tensor_parallel_size + 1,
-                    world_size,
-                    "openrlhf",
-                    backend=backend,
-                    timeout_minutes=self.args.backend_timeout,
+            if self.args.single_gpu_mode:
+                refs = [
+                    engine.init_weight_transfer_engine.remote(WeightTransferInitRequest(init_info={}))
+                    for engine in vllm_engines
+                ]
+            else:
+                master_address = self.get_current_node_ip()
+                master_port = utils.find_free_port()
+                vllm_num_engines, vllm_tensor_parallel_size = (
+                    self.vllm_config.vllm_num_engines,
+                    self.vllm_config.vllm_tensor_parallel_size,
                 )
-                for i, engine in enumerate(vllm_engines)
-            ]
-            torch.cuda.set_device(self.local_rank)
-            self.model_update_group = vllm_utils.init_process_group(
-                backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
-                world_size=world_size,
-                rank=0,
-                group_name="openrlhf",
-                timeout=timedelta(minutes=self.args.backend_timeout),
-            )
-            ray_get_with_progress(refs, desc="Initializing vLLM process groups", timeout=600)
+                world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
+                init_info = {"master_address": master_address, "master_port": master_port, "world_size": world_size}
+                refs = [
+                    engine.init_weight_transfer_engine.remote(
+                        WeightTransferInitRequest(
+                            init_info=init_info | {"rank_offset": i * vllm_tensor_parallel_size + 1}
+                        )
+                    )
+                    for i, engine in enumerate(vllm_engines)
+                ]
+                torch.cuda.set_device(self.local_rank)
+                self.model_update_group = NCCLWeightTransferEngine.trainer_init(init_info)
+            ray_get_with_progress(refs, desc="Initializing vLLM weight transfer engines", timeout=600)
         torch.distributed.barrier()
+
+    def _build_cp_contexts_for_batch(self, data_BT) -> list:
+        """Build one FLA CP context per sample, correctly reflecting which
+        sub-sequences cross rank boundaries.
+
+        Returns a list of length ``len(data_BT)`` where each entry is either an
+        :class:`fla.ops.cp.context.FLACPContext` (under SP>1 with global
+        position_ids attached) or ``None`` (SP==1, non-hybrid model, or
+        global position_ids unavailable).
+        """
+        num_samples = len(data_BT.query_responses)
+        if self._sp_world_size <= 1 or getattr(data_BT, "global_position_ids", None) is None:
+            return [None] * num_samples
+        # Only build CP context for models with linear-attention layers. We
+        # detect this the same way the patch does — presence of the config
+        # attribute ``linear_conv_kernel_dim`` (on text_config for VLM shells).
+        if self._conv_kernel_size is None:
+            return [None] * num_samples
+
+        local_seq_len = data_BT.position_ids[0].shape[-1]
+        contexts: list = []
+        for gpi in data_BT.global_position_ids:
+            contexts.append(
+                grpo_utils.build_fla_cp_context_for_sample(
+                    global_position_ids=gpi,
+                    sp_world_size=self._sp_world_size,
+                    sp_group=self._sp_group,
+                    conv_kernel_size=self._conv_kernel_size,
+                    local_seq_len=local_seq_len,
+                )
+            )
+        return contexts
 
     def broadcast_to_vllm(self):
         # avoid OOM
@@ -514,12 +750,122 @@ class PolicyTrainerRayProcess(RayProcess):
         self.local_metrics["_token_count"] = token_counts.sum().item()
         self.local_metrics["lr"] = self.scheduler.get_last_lr()[0]
 
-    def step(self):
+    def _record_vllm_local_logprob_debug(
+        self, local_logprobs: torch.Tensor, vllm_logprobs: torch.Tensor, response_mask: torch.Tensor
+    ) -> None:
+        valid_mask = response_mask & ~torch.isnan(vllm_logprobs)
+        logprob_diff = (local_logprobs - vllm_logprobs).abs()
+        masked_diff = torch.masked_fill(logprob_diff, ~valid_mask, 0.0)
+        mean_diff = masked_diff.sum() / valid_mask.sum() if valid_mask.sum() > 0 else 0.0
+        max_diff = masked_diff.max()
+        std_diff = masked_diff[valid_mask].std() if valid_mask.sum() > 1 else 0.0
+
+        self.local_metrics["debug/vllm_vs_local_logprob_diff_mean"] = float(mean_diff)
+        self.local_metrics["debug/vllm_vs_local_logprob_diff_max"] = float(max_diff)
+        self.local_metrics["debug/vllm_vs_local_logprob_diff_std"] = float(std_diff)
+
+        reverse_kl = torch.exp(vllm_logprobs) * (vllm_logprobs - local_logprobs)
+        masked_reverse_kl = torch.masked_fill(reverse_kl, ~valid_mask, 0.0)
+        mean_reverse_kl = masked_reverse_kl.sum() / valid_mask.sum() if valid_mask.sum() > 0 else 0.0
+        self.local_metrics["debug/vllm_local_reverse_kl"] = float(mean_reverse_kl)
+
+    def _compute_tiled_dapo_loss(
+        self,
+        query_responses: torch.Tensor,
+        position_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        advantages: torch.Tensor,
+        old_logprobs: torch.Tensor,
+        ref_logprobs: torch.Tensor | None,
+        policy_mask: torch.Tensor | None,
+        policy_freeze_mask: torch.Tensor | None,
+        loss_denominator: float,
+        loss_denominator_mode: str,
+        rollout_sample_ids: torch.Tensor | None,
+        cp_context: Any,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        hidden_states = grpo_utils.forward_for_liger_hidden_states(
+            self.model, query_responses, None, position_ids, cp_context=cp_context
+        )
+        if self.args.lm_head_fp32:
+            hidden_states = hidden_states.float()
+
+        _, lm_head = grpo_utils.get_causal_lm_backbone_and_lm_head(self.model)
+        selected_token_ids = query_responses[:, 1:].clone()
+        response_mask = response_mask.bool()
+        selected_token_ids = torch.where(response_mask, selected_token_ids, torch.zeros_like(selected_token_ids))
+        advantages = torch.where(response_mask, advantages, torch.zeros_like(advantages))
+        old_logprobs = torch.where(response_mask, old_logprobs, torch.zeros_like(old_logprobs))
+        if ref_logprobs is not None:
+            ref_logprobs = torch.where(response_mask, ref_logprobs, torch.zeros_like(ref_logprobs))
+
+        if loss_denominator_mode == "sequence":
+            loss_weights, _ = grpo_utils._sequence_loss_weights(response_mask, rollout_sample_ids, self._sp_group)
+            current_global_count = loss_weights.sum().float().detach()
+        else:
+            current_global_count = response_mask.sum().float().detach()
+        dist.all_reduce(current_global_count, op=dist.ReduceOp.SUM)
+        # Drain all queued device work through this collective so ranks enter
+        # ZeRO-3 backward with bounded skew.
+        torch.cuda.synchronize()
+        dp_world_size = self.args.world_size // self.args.sequence_parallel_size
+        scale = current_global_count * dp_world_size / (self.args.world_size * float(loss_denominator))
+        loss, kl_avg, clipfrac, ratio_avg = grpo_utils.tiled_grpo_lm_head_loss(
+            lm_head=lm_head,
+            hidden_states=hidden_states,
+            selected_token_ids=selected_token_ids,
+            response_mask=response_mask,
+            policy_mask=policy_mask,
+            advantages=advantages,
+            old_logprobs=old_logprobs,
+            ref_logprobs=ref_logprobs,
+            temperature=self.streaming_config.temperature,
+            beta=self.args.beta if self.args.load_ref_policy else 0.0,
+            clip_lower=self.args.clip_lower,
+            clip_higher=self.args.clip_higher,
+            shards=max(1, int(self.args.liger_grpo_loss_chunk_size)),
+            loss_scale=scale,
+            loss_fn=self.args.loss_fn,
+            dppo_divergence_type=self.args.dppo_divergence_type,
+            dppo_divergence_threshold=self.args.dppo_divergence_threshold,
+            tvpo_truncation_cap=self.args.tvpo_truncation_cap,
+            loss_denominator=loss_denominator_mode,
+            rollout_sample_ids=rollout_sample_ids,
+            sequence_process_group=self._sp_group,
+            policy_freeze_mask=policy_freeze_mask,
+        )
+        if ref_logprobs is not None:
+            return loss, (kl_avg, clipfrac, ratio_avg)
+        return loss, (clipfrac, ratio_avg)
+
+    def _compute_logprobs(
+        self, model: torch.nn.Module, data_BT: data_types.CollatedBatchData, cp_contexts_BT: list[Any]
+    ) -> list[torch.Tensor]:
+        return grpo_utils.compute_logprobs(
+            model,
+            data_BT,
+            self.pad_token_id,
+            self.streaming_config.temperature,
+            use_grad=False,
+            cp_contexts=cp_contexts_BT,
+        )
+
+    def step(self, training_step: int | None = None):
         """Execute one training step: fetch data from the dataloader and train on it.
+
+        Args:
+            training_step: Optional training step index, used for tracing when
+                ``streaming_config.save_traces`` is enabled. When not provided we
+                fall back to an internal counter that ticks once per call.
 
         Returns:
             Tuple of (metrics_list, array_metrics) from training.
         """
+        if not hasattr(self, "_trace_step_counter"):
+            self._trace_step_counter = 0
+        self._trace_step_counter += 1
+        if training_step is None:
+            training_step = self._trace_step_counter
         batch_data = next(self.dataloader)
         data_BT = batch_data["batch"]
         if len(data_BT) == 0:
@@ -542,12 +888,15 @@ class PolicyTrainerRayProcess(RayProcess):
 
         num_mini_batches = len(data_BT.query_responses) // accumulation_steps
 
+        # Build a per-sample FLA CP context for Qwen3.5 hybrid linear attention
+        # under Ulysses SP.  Under SP=1 or on non-linear-attention models we
+        # fall through to a list of ``None``.
+        cp_contexts_BT = self._build_cp_contexts_for_batch(data_BT)
+
         ref_logprobs_BT: list[torch.Tensor] = []
         if self.args.load_ref_policy:
             with Timer("Inference Calculation", noop=self.rank != 0):
-                ref_logprobs_BT = grpo_utils.compute_logprobs(
-                    self.ref_policy, data_BT, self.pad_token_id, self.streaming_config.temperature, use_grad=False
-                )
+                ref_logprobs_BT = self._compute_logprobs(self.ref_policy, data_BT, cp_contexts_BT)
 
         # if we have multiple minibatches, we need to calculate the old logprobs for each minibatch
         # following gtrl scripts in just doing this on the current active policy, rather than use the logprobs
@@ -557,9 +906,7 @@ class PolicyTrainerRayProcess(RayProcess):
             with Timer("Old logprobs Calculation", noop=self.rank != 0):
                 local_old_logprobs_BT = None
                 if not self.args.use_vllm_logprobs:
-                    local_old_logprobs_BT = grpo_utils.compute_logprobs(
-                        self.model, data_BT, self.pad_token_id, self.streaming_config.temperature, use_grad=False
-                    )
+                    local_old_logprobs_BT = self._compute_logprobs(self.model, data_BT, cp_contexts_BT)
 
                 with torch.no_grad():
                     for i in range(len(data_BT.query_responses)):
@@ -572,6 +919,61 @@ class PolicyTrainerRayProcess(RayProcess):
 
                         torch.cuda.empty_cache()
 
+        # Save trainer-side logprobs alongside rollouts for offline analysis.
+        # ``compute_logprobs`` runs a distributed forward (ZeRO-3 all-gathers +
+        # Ulysses SP all-to-alls), so every rank must participate. Every rank
+        # writes its local trace to a rank-scoped file; under SP those files can
+        # be stitched together offline by (dp_rank, sample_idx, sp_rank).
+        if (
+            self.streaming_config.save_traces
+            and self.streaming_config.save_trainer_logprobs
+            and self.streaming_config.rollouts_save_path
+        ):
+            with Timer("Trainer logprobs trace save", noop=self.rank != 0), torch.no_grad():
+                if all(x is None for x in old_logprobs_BT):
+                    trace_logprobs_BT = self._compute_logprobs(self.model, data_BT, cp_contexts_BT)
+                else:
+                    trace_logprobs_BT = [
+                        lp
+                        if lp is not None
+                        else torch.zeros_like(data_BT.response_masks[i][:, 1:], dtype=torch.float32)
+                        for i, lp in enumerate(old_logprobs_BT)
+                    ]
+                sp_size = getattr(self.args, "sequence_parallel_size", 1)
+                trace_prompt_masks = (
+                    [m[:, 1:] for m in data_BT.prompt_masks] if data_BT.prompt_masks is not None else None
+                )
+                trace_rollout_sample_ids = (
+                    [ids[:, 1:] for ids in data_BT.rollout_sample_ids]
+                    if data_BT.rollout_sample_ids is not None
+                    else None
+                )
+                trace_model_steps = (
+                    [model_steps[:, 1:] for model_steps in data_BT.model_steps]
+                    if data_BT.model_steps is not None
+                    else None
+                )
+                rl_utils.save_trainer_logprobs_to_disk(
+                    save_path=self.streaming_config.rollouts_save_path,
+                    run_name=self.args.run_name,
+                    step=training_step,
+                    trainer_logprobs=trace_logprobs_BT,
+                    response_masks=[m[:, 1:] for m in data_BT.response_masks],
+                    sp_size=sp_size,
+                    trainer_model_step=training_step,
+                    input_token_ids=data_BT.query_responses,
+                    token_ids=[qr[:, 1:] for qr in data_BT.query_responses],
+                    prompt_masks=trace_prompt_masks,
+                    attention_masks=[m[:, 1:] for m in data_BT.attention_masks],
+                    rollout_sample_ids=trace_rollout_sample_ids,
+                    model_steps=trace_model_steps,
+                    vllm_logprobs=[lp[:, 1:] for lp in data_BT.vllm_logprobs],
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    dp_rank=self.rank // sp_size,
+                    sp_rank=self.rank % sp_size,
+                )
+
         local_step = 0
         num_samples = len(data_BT.query_responses)
         # Pre-compute token counts per sample (for weighted averaging across SP ranks)
@@ -579,16 +981,118 @@ class PolicyTrainerRayProcess(RayProcess):
         token_counts_per_sample = torch.stack([mask[:, 1:].sum().float() for mask in data_BT.response_masks])
         device = token_counts_per_sample.device
         grad_norms: list[float] = []  # May include nan/inf values reported by DeepSpeed.
+        value_loss_inputs: list[dict[str, torch.Tensor]] | None = None
+        value_step_metrics: dict[str, float] = {}
+        if self.args.use_value_model:
+            assert data_BT.rewards is not None and data_BT.dones is not None, (
+                "use_value_model=True but rewards/dones are missing from CollatedBatchData"
+            )
+            value_loss_inputs = []
+            returns_all: list[float] = []
+            preds_all: list[float] = []
+            with Timer("Value forward (no-grad)", noop=self.rank != 0), torch.no_grad():
+                for i in range(num_samples):
+                    resp_mask = data_BT.response_masks[i][:, 1:].bool()
+                    values_BT = self.forward_value(data_BT.query_responses[i], data_BT.position_ids[i], resp_mask)
+                    values_BT = self._align_value_predictions(values_BT, resp_mask.shape, "value forward")
+                    rewards = data_BT.rewards[i][:, 1:].float().cpu().numpy()
+                    dones = data_BT.dones[i][:, 1:].long().cpu().numpy()
+                    resp_masks_np = resp_mask.long().cpu().numpy()
+                    adv_np, returns_np = self._dispatch_gae(
+                        values_np=values_BT.float().cpu().numpy(),
+                        rewards_np=rewards,
+                        dones_np=dones,
+                        response_masks_np=resp_masks_np,
+                    )
+
+                    new_adv = torch.zeros_like(data_BT.advantages[i])
+                    new_adv[:, 1:] = torch.from_numpy(adv_np.astype("float32")).to(device)
+                    data_BT.advantages[i] = new_adv
+
+                    value_mask = data_BT.response_masks[i][:, :-1].bool()
+                    returns = torch.from_numpy(returns_np.astype("float32")).to(device)
+                    value_loss_inputs.append(
+                        {
+                            "returns": returns,
+                            "old_values": values_BT.detach(),
+                            "response_mask": resp_mask,
+                            "value_mask": value_mask,
+                        }
+                    )
+                    valid_values = value_mask.cpu().numpy().astype(bool)
+                    if valid_values.any():
+                        returns_all.extend(returns_np[valid_values].tolist())
+                        preds_all.extend(values_BT.float().cpu().numpy()[valid_values].tolist())
+
+            if self.args.whiten_advantages:
+                local_adv = [
+                    data_BT.advantages[i][:, 1:].float()[data_BT.response_masks[i][:, 1:].bool()]
+                    for i in range(num_samples)
+                ]
+                local_adv = [adv for adv in local_adv if adv.numel() > 0]
+                if local_adv:
+                    adv_flat = torch.cat(local_adv)
+                    count = torch.tensor(float(adv_flat.numel()), device=device)
+                    s1 = adv_flat.sum()
+                    s2 = (adv_flat**2).sum()
+                else:
+                    count = torch.zeros((), device=device)
+                    s1 = torch.zeros((), device=device)
+                    s2 = torch.zeros((), device=device)
+                dist.all_reduce(count, op=dist.ReduceOp.SUM)
+                dist.all_reduce(s1, op=dist.ReduceOp.SUM)
+                dist.all_reduce(s2, op=dist.ReduceOp.SUM)
+                mean = s1 / count.clamp(min=1)
+                std = ((s2 / count.clamp(min=1) - mean**2).clamp(min=0) + 1e-8).sqrt()
+                for i in range(num_samples):
+                    mask_i = data_BT.response_masks[i][:, 1:].bool()
+                    adv_i = data_BT.advantages[i][:, 1:]
+                    normed = torch.where(mask_i, (adv_i - mean) / std, torch.zeros_like(adv_i))
+                    new_adv = data_BT.advantages[i].clone()
+                    new_adv[:, 1:] = normed
+                    data_BT.advantages[i] = new_adv
+
+            if returns_all and preds_all:
+                returns_np = np.array(returns_all, dtype="float32")
+                preds_np = np.array(preds_all, dtype="float32")
+                residuals = returns_np - preds_np
+                return_var = float(np.var(returns_np))
+                value_step_metrics["value/returns_mean"] = float(np.mean(returns_np))
+                value_step_metrics["value/returns_std"] = float(np.std(returns_np))
+                value_step_metrics["value/predictions_mean"] = float(np.mean(preds_np))
+                value_step_metrics["value/predictions_std"] = float(np.std(preds_np))
+                value_step_metrics["value/explained_variance"] = 1.0 - float(np.var(residuals)) / (return_var + 1e-8)
+        tis_mask_enabled = (
+            self.args.tis_mask_lower > 0.0
+            or self.args.tis_mask_upper > 0.0
+            or self.args.sequence_tis_mask_log_ratio_threshold > 0.0
+        )
+        tis_mask_kept_tokens = torch.zeros((), device=device)
+        tis_mask_total_tokens = torch.zeros((), device=device)
+        dppo_enabled = self.args.loss_fn == grpo_utils.GRPOLossType.dppo
+        dppo_mask_kept_tokens = torch.zeros((), device=device)
+        dppo_mask_total_tokens = torch.zeros((), device=device)
+        tvpo_enabled = self.args.loss_fn == grpo_utils.GRPOLossType.tvpo
+        tvpo_mask_kept_tokens = torch.zeros((), device=device)
+        tvpo_mask_total_tokens = torch.zeros((), device=device)
+        tvpo_tv_weighted_sum = torch.zeros((), device=device)
+        tvpo_tv_weight = torch.zeros((), device=device)
         # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
         with Timer("[Training Processes] Loss calculation", noop=self.rank != 0):
             loss_stats_B = grpo_utils.create_loss_stats(num_samples, device, record_entropy=self.args.record_entropy)
             for epoch_idx in range(self.args.num_epochs):
-                # Pre-compute total tokens for each accumulation group if using "token" normalization
-                # This ensures all minibatches in an accumulation group are normalized by the same total
                 if self.args.loss_denominator == "token":
-                    accumulation_token_counts = self.calculate_token_counts(accumulation_steps, data_BT)
+                    accumulation_loss_denominators = self.calculate_token_counts(accumulation_steps, data_BT)
+                elif self.args.loss_denominator == "sequence":
+                    accumulation_loss_denominators = grpo_utils.calculate_sequence_counts(
+                        accumulation_steps,
+                        data_BT,
+                        device,
+                        sequence_process_group=self._sp_group,
+                        sequence_group_rank=self._sp_rank,
+                    )
                 else:
-                    accumulation_token_counts = {
+                    accumulation_loss_denominators = {
                         int(group_idx * accumulation_steps): float(self.args.loss_denominator)
                         for group_idx in range((len(data_BT.query_responses) // accumulation_steps) + 1)
                     }
@@ -597,38 +1101,167 @@ class PolicyTrainerRayProcess(RayProcess):
                     response_mask_BT = data_BT.response_masks[i][:, 1:]
                     # retrieve the loss denominator for the current batch
                     batch_start = (i // accumulation_steps) * accumulation_steps
-                    loss_denominator = accumulation_token_counts[batch_start]
+                    loss_denominator = accumulation_loss_denominators[batch_start]
+                    # Pass attention_mask=None so HF constructs the correct 3D intra-document
+                    # mask from position_ids internally for packed sequences.
+                    advantages_BT = data_BT.advantages[i][:, 1:]
+                    if self.args.use_liger_grpo_loss:
+                        vllm_logprobs_BT = grpo_utils.mask_logprobs(data_BT.vllm_logprobs[i][:, 1:], response_mask_BT)
+                        tvpo_policy_freeze_mask_BT = None
+                        with torch.no_grad():
+                            debug_logprobs_BT, _ = grpo_utils.forward_for_logprobs(
+                                self.model,
+                                data_BT.query_responses[i],
+                                None,
+                                data_BT.position_ids[i],
+                                self.pad_token_id,
+                                self.streaming_config.temperature,
+                                return_entropy=False,
+                                cp_context=cp_contexts_BT[i],
+                            )
+                            debug_logprobs_BT = grpo_utils.mask_logprobs(debug_logprobs_BT, response_mask_BT)
+                            old_logprob_BT = grpo_utils.resolve_old_logprob(
+                                old_logprobs_BT,
+                                i,
+                                epoch_idx,
+                                num_mini_batches,
+                                self.args.use_vllm_logprobs,
+                                vllm_logprobs_BT,
+                                debug_logprobs_BT,
+                            )
+                            tis_clamped_BT, _ = grpo_utils.compute_tis_weights(
+                                old_logprob_BT,
+                                vllm_logprobs_BT,
+                                response_mask_BT,
+                                self.args.truncated_importance_sampling_ratio_cap,
+                            )
+                            tis_mask_BT = grpo_utils.compute_tis_mask(
+                                debug_logprobs_BT,
+                                vllm_logprobs_BT,
+                                response_mask_BT,
+                                self.args.tis_mask_lower,
+                                self.args.tis_mask_upper,
+                            )
+                            sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
+                                debug_logprobs_BT,
+                                vllm_logprobs_BT,
+                                advantages_BT,
+                                response_mask_BT,
+                                self.args.sequence_tis_mask_log_ratio_threshold,
+                                self.args.sequence_tis_mask_negative_advantages_only,
+                                data_BT.rollout_sample_ids[i][:, 1:]
+                                if data_BT.rollout_sample_ids is not None
+                                else None,
+                                self._sp_group,
+                            )
+                            self._record_vllm_local_logprob_debug(
+                                debug_logprobs_BT, vllm_logprobs_BT, response_mask_BT
+                            )
+                            effective_tis_mask_BT = grpo_utils.combine_tis_terms(tis_mask_BT, sequence_tis_mask_BT)
+                            combined_tis_BT = grpo_utils.combine_tis_terms(
+                                tis_clamped_BT, tis_mask_BT, sequence_tis_mask_BT
+                            )
+                            if effective_tis_mask_BT is not None:
+                                tis_mask_kept_tokens += effective_tis_mask_BT.sum()
+                                tis_mask_total_tokens += response_mask_BT.sum()
+                            if self.args.loss_fn == grpo_utils.GRPOLossType.dppo:
+                                debug_ratio_BT = torch.exp(debug_logprobs_BT - vllm_logprobs_BT)
+                                debug_dppo_mask_BT, _ = grpo_utils.compute_dppo_mask(
+                                    new_logprobs=debug_logprobs_BT,
+                                    behavior_logprobs=vllm_logprobs_BT,
+                                    advantages=advantages_BT,
+                                    ratio=debug_ratio_BT,
+                                    response_mask=response_mask_BT,
+                                    divergence_type=self.args.dppo_divergence_type,
+                                    divergence_threshold=self.args.dppo_divergence_threshold,
+                                )
+                                dppo_mask_kept_tokens += debug_dppo_mask_BT.sum()
+                                dppo_mask_total_tokens += response_mask_BT.sum()
+                            if self.args.loss_fn == grpo_utils.GRPOLossType.tvpo:
+                                debug_ratio_BT = torch.exp(debug_logprobs_BT - vllm_logprobs_BT)
+                                rollout_ids_BT = (
+                                    data_BT.rollout_sample_ids[i][:, 1:]
+                                    if data_BT.rollout_sample_ids is not None
+                                    else None
+                                )
+                                tvpo_policy_freeze_mask_BT, debug_tvpo_prompt_tv_BT = grpo_utils.compute_tvpo_mask(
+                                    new_logprobs=debug_logprobs_BT,
+                                    behavior_logprobs=vllm_logprobs_BT,
+                                    advantages=advantages_BT,
+                                    ratio=debug_ratio_BT,
+                                    response_mask=response_mask_BT,
+                                    divergence_threshold=self.args.tvpo_divergence_threshold,
+                                    rollout_ids=rollout_ids_BT,
+                                    num_samples_per_prompt=self.streaming_config.num_samples_per_prompt_rollout,
+                                    sequence_process_group=self._sp_group,
+                                )
+                                tvpo_mask_kept_tokens += tvpo_policy_freeze_mask_BT.sum()
+                                tvpo_mask_total_tokens += response_mask_BT.sum()
+                                tvpo_tv_weighted_sum += (debug_tvpo_prompt_tv_BT * response_mask_BT).sum()
+                                tvpo_tv_weight += response_mask_BT.sum()
+                        is_accumulation_boundary = (local_step + 1) % accumulation_steps == 0
+                        self.model.set_gradient_accumulation_boundary(is_accumulation_boundary)
+                        loss, tiled_metrics = self._compute_tiled_dapo_loss(
+                            query_responses=data_BT.query_responses[i],
+                            position_ids=data_BT.position_ids[i],
+                            response_mask=response_mask_BT,
+                            advantages=advantages_BT,
+                            old_logprobs=old_logprob_BT,
+                            ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
+                            policy_mask=combined_tis_BT,
+                            policy_freeze_mask=tvpo_policy_freeze_mask_BT,
+                            loss_denominator=loss_denominator,
+                            loss_denominator_mode=self.args.loss_denominator,
+                            rollout_sample_ids=(
+                                data_BT.rollout_sample_ids[i][:, 1:]
+                                if data_BT.rollout_sample_ids is not None
+                                else None
+                            ),
+                            cp_context=cp_contexts_BT[i],
+                        )
+
+                        torch.cuda.empty_cache()
+                        self.model.backward(loss)
+                        if is_accumulation_boundary:
+                            self.model.step()
+                            grad_norms.append(float(self.model.get_global_grad_norm()))
+                        local_step += 1
+                        # Bound inter-iteration drift from async backward/ZeRO work
+                        # before this rank starts the next sample.
+                        dist.barrier(device_ids=[self.local_rank])
+                        torch.cuda.synchronize()
+
+                        with torch.no_grad():
+                            if self.args.load_ref_policy:
+                                kl_metrics = tiled_metrics[0]
+                                for kl_idx in range(4):
+                                    loss_stats_B[f"objective/kl{kl_idx}_avg"][i] = kl_metrics[kl_idx]
+                                loss_stats_B["loss/kl_avg"][i] = kl_metrics[self.args.kl_estimator] * self.args.beta
+                                clip_metric = tiled_metrics[1]
+                                ratio_metric = tiled_metrics[2]
+                            else:
+                                clip_metric = tiled_metrics[0]
+                                ratio_metric = tiled_metrics[1]
+                            loss_stats_B["policy/clipfrac_avg"][i] = clip_metric
+                            loss_stats_B["loss/total_avg"][i] = loss.detach()
+                            loss_stats_B["val/ratio"][i] = ratio_metric
+                        continue
+
                     local_logprobs_BT, entropy_BT = grpo_utils.forward_for_logprobs(
                         self.model,
                         data_BT.query_responses[i],
-                        data_BT.attention_masks[i],
+                        None,
                         data_BT.position_ids[i],
                         self.pad_token_id,
                         self.streaming_config.temperature,
                         return_entropy=self.args.record_entropy,
+                        cp_context=cp_contexts_BT[i],
                     )
                     local_logprobs_BT = grpo_utils.mask_logprobs(local_logprobs_BT, response_mask_BT)
                     vllm_logprobs_BT = grpo_utils.mask_logprobs(data_BT.vllm_logprobs[i][:, 1:], response_mask_BT)
 
-                    # Compare vLLM logprobs with local logprobs
                     with torch.no_grad():
-                        valid_mask_BT = response_mask_BT & ~torch.isnan(vllm_logprobs_BT)
-                        logprob_diff_BT = (local_logprobs_BT - vllm_logprobs_BT).abs()
-                        masked_diff_BT = torch.masked_fill(logprob_diff_BT, ~valid_mask_BT, 0.0)
-                        mean_diff = masked_diff_BT.sum() / valid_mask_BT.sum() if valid_mask_BT.sum() > 0 else 0.0
-                        max_diff = masked_diff_BT.max()
-                        std_diff = masked_diff_BT[valid_mask_BT].std() if valid_mask_BT.sum() > 1 else 0.0
-
-                        self.local_metrics["debug/vllm_vs_local_logprob_diff_mean"] = float(mean_diff)
-                        self.local_metrics["debug/vllm_vs_local_logprob_diff_max"] = float(max_diff)
-                        self.local_metrics["debug/vllm_vs_local_logprob_diff_std"] = float(std_diff)
-
-                        reverse_kl_BT = torch.exp(vllm_logprobs_BT) * (vllm_logprobs_BT - local_logprobs_BT)
-                        masked_reverse_kl_BT = torch.masked_fill(reverse_kl_BT, ~valid_mask_BT, 0.0)
-                        mean_reverse_kl = (
-                            masked_reverse_kl_BT.sum() / valid_mask_BT.sum() if valid_mask_BT.sum() > 0 else 0.0
-                        )
-                        self.local_metrics["debug/vllm_local_reverse_kl"] = float(mean_reverse_kl)
+                        self._record_vllm_local_logprob_debug(local_logprobs_BT, vllm_logprobs_BT, response_mask_BT)
 
                     new_logprobs_BT = local_logprobs_BT
 
@@ -642,7 +1275,11 @@ class PolicyTrainerRayProcess(RayProcess):
                         local_logprobs_BT,
                     )
 
-                    # Calculate the policy's loss
+                    # Calculate the policy's loss. DPPO requires
+                    # `use_vllm_logprobs=True` (validated in GRPOExperimentConfig),
+                    # which sets `old_logprob_BT == vllm_logprobs_BT`, giving us
+                    # the trust-region anchor μ_θ' from Takeaway 2 in
+                    # arXiv:2602.04879 without a separate code path.
                     logprobs_diff_BT = new_logprobs_BT - old_logprob_BT
                     ratio_BT = torch.exp(logprobs_diff_BT)
                     tis_clamped_BT, tis_unclamped_BT = grpo_utils.compute_tis_weights(
@@ -651,18 +1288,96 @@ class PolicyTrainerRayProcess(RayProcess):
                         response_mask_BT,
                         self.args.truncated_importance_sampling_ratio_cap,
                     )
+                    tis_mask_BT = grpo_utils.compute_tis_mask(
+                        new_logprobs_BT,
+                        vllm_logprobs_BT,
+                        response_mask_BT,
+                        self.args.tis_mask_lower,
+                        self.args.tis_mask_upper,
+                    )
+                    sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
+                        new_logprobs_BT,
+                        vllm_logprobs_BT,
+                        advantages_BT,
+                        response_mask_BT,
+                        self.args.sequence_tis_mask_log_ratio_threshold,
+                        self.args.sequence_tis_mask_negative_advantages_only,
+                        data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
+                        self._sp_group,
+                    )
+                    if self.args.loss_fn == grpo_utils.GRPOLossType.dppo:
+                        dppo_mask_BT, _ = grpo_utils.compute_dppo_mask(
+                            new_logprobs=new_logprobs_BT,
+                            behavior_logprobs=vllm_logprobs_BT,
+                            advantages=advantages_BT,
+                            ratio=ratio_BT,
+                            response_mask=response_mask_BT,
+                            divergence_type=self.args.dppo_divergence_type,
+                            divergence_threshold=self.args.dppo_divergence_threshold,
+                        )
+                        with torch.no_grad():
+                            dppo_mask_kept_tokens += dppo_mask_BT.sum()
+                            dppo_mask_total_tokens += response_mask_BT.sum()
+                    else:
+                        dppo_mask_BT = None
+                    if self.args.loss_fn == grpo_utils.GRPOLossType.tvpo:
+                        # TVPO needs to know which tokens belong to which prompt, so we
+                        # pass the per-token rollout id (each rollout's tokens stay
+                        # contiguous after packing) and the per-prompt fanout. When
+                        # rollout ids aren't available we fall back to per-microbatch
+                        # aggregation which still computes a meaningful (single-prompt) TV.
+                        rollout_ids_BT = (
+                            data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None
+                        )
+                        tvpo_mask_BT, tvpo_prompt_tv_BT = grpo_utils.compute_tvpo_mask(
+                            new_logprobs=new_logprobs_BT,
+                            behavior_logprobs=vllm_logprobs_BT,
+                            advantages=advantages_BT,
+                            ratio=ratio_BT,
+                            response_mask=response_mask_BT,
+                            divergence_threshold=self.args.tvpo_divergence_threshold,
+                            rollout_ids=rollout_ids_BT,
+                            num_samples_per_prompt=self.streaming_config.num_samples_per_prompt_rollout,
+                            sequence_process_group=self._sp_group,
+                        )
+                        with torch.no_grad():
+                            tvpo_mask_kept_tokens += tvpo_mask_BT.sum()
+                            tvpo_mask_total_tokens += response_mask_BT.sum()
+                            response_count = response_mask_BT.sum()
+                            tvpo_tv_weighted_sum += (tvpo_prompt_tv_BT * response_mask_BT).sum()
+                            tvpo_tv_weight += response_count
+                    else:
+                        tvpo_mask_BT = None
+                    combined_tis_BT = grpo_utils.combine_tis_terms(
+                        tis_clamped_BT, tis_mask_BT, sequence_tis_mask_BT, dppo_mask_BT
+                    )
+
+                    effective_tis_mask_BT = grpo_utils.combine_tis_terms(tis_mask_BT, sequence_tis_mask_BT)
+                    if effective_tis_mask_BT is not None:
+                        with torch.no_grad():
+                            tis_mask_kept_tokens += effective_tis_mask_BT.sum()
+                            tis_mask_total_tokens += response_mask_BT.sum()
 
                     pg_losses_BT, pg_losses2_BT, pg_loss_max_BT, kl_BT = grpo_utils.compute_grpo_loss(
                         new_logprobs=new_logprobs_BT,
                         ratio=ratio_BT,
-                        advantages=data_BT.advantages[i][:, 1:],
+                        advantages=advantages_BT,
                         ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                         config=self.args,
-                        tis_weights=tis_clamped_BT,
+                        tis_weights=combined_tis_BT,
+                        policy_freeze_mask=tvpo_mask_BT,
                     )
 
                     per_token_loss_BT = pg_loss_max_BT + self.args.beta * kl_BT
-                    loss = masked_mean(per_token_loss_BT, response_mask_BT, None, loss_denominator)
+                    if self.args.loss_denominator == "sequence":
+                        rollout_ids_BT = (
+                            data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None
+                        )
+                        loss = grpo_utils.sequence_weighted_mean(
+                            per_token_loss_BT, response_mask_BT, loss_denominator, rollout_ids_BT, self._sp_group
+                        )
+                    else:
+                        loss = masked_mean(per_token_loss_BT, response_mask_BT, None, loss_denominator)
 
                     # we already took world size into account via the tokens
                     # but deepspeed will try to average over ranks, so multiply back
@@ -696,10 +1411,83 @@ class PolicyTrainerRayProcess(RayProcess):
                         tis_unclamped=tis_unclamped_BT,
                     )
 
+            if self.args.use_value_model and value_loss_inputs is not None:
+                torch.cuda.empty_cache()
+                with Timer("[Training Processes] Value loss", noop=self.rank != 0):
+                    value_accum_steps = max(
+                        math.ceil(num_samples / max(self._value_effective_mini_batches, 1) - 0.5), 1
+                    )
+                    value_losses: list[float] = []
+                    value_clipfracs: list[float] = []
+                    for i, ctx in enumerate(value_loss_inputs):
+                        resp_mask = ctx["response_mask"]
+                        value_mask = ctx["value_mask"]
+                        returns = ctx["returns"]
+                        old_values = ctx["old_values"]
+                        new_values = self.forward_value(data_BT.query_responses[i], data_BT.position_ids[i], resp_mask)
+                        new_values = self._align_value_predictions(new_values, returns.shape, "value loss forward")
+                        per_tok, v_clipfrac = value_model_utils.value_clipped_mse_loss(
+                            new_values, returns, old_values, value_mask, self.args.vf_clip_range
+                        )
+                        denom = value_mask.sum().clamp(min=1).float()
+                        v_loss = (per_tok.sum() / denom) * self.args.value_loss_coef
+                        v_loss = v_loss * (self.args.world_size // self.args.sequence_parallel_size)
+                        v_loss = v_loss.reshape(-1).sum()
+                        if not v_loss.requires_grad:
+                            v_loss = (
+                                v_loss
+                                + 0.0
+                                * self._dummy_value_forward(data_BT.query_responses[i].dtype, device).reshape(-1).sum()
+                            )
+                        is_value_boundary = (i + 1) % value_accum_steps == 0 or (i + 1) == num_samples
+                        self.value_model.set_gradient_accumulation_boundary(is_value_boundary)
+                        self.value_model.backward(v_loss)
+                        if is_value_boundary:
+                            torch.cuda.empty_cache()
+                            self.value_model.step()
+                        value_losses.append(float(v_loss.detach()))
+                        value_clipfracs.append(float(v_clipfrac.detach()))
+
+                    if value_losses:
+                        self.local_metrics["loss/value_avg"] = sum(value_losses) / len(value_losses)
+                        self.local_metrics["value/clipfrac_avg"] = sum(value_clipfracs) / len(value_clipfracs)
+                        if hasattr(self.value_model, "get_global_grad_norm"):
+                            grad_norm = float(self.value_model.get_global_grad_norm())
+                            if math.isfinite(grad_norm):
+                                self.local_metrics["value/grad_norm"] = grad_norm
+            for key, value in value_step_metrics.items():
+                self.local_metrics[key] = value
+
             batch_metrics = batch_data["metrics"]
             with torch.no_grad():
                 self._compute_loss_metrics(loss_stats_B, token_counts_per_sample)
-                self.local_metrics["optim/grad_norm"] = sum(grad_norms) / len(grad_norms)
+                if tis_mask_enabled:
+                    frac_kept = (
+                        tis_mask_kept_tokens / tis_mask_total_tokens
+                        if tis_mask_total_tokens > 0
+                        else torch.zeros((), device=device)
+                    )
+                    self.local_metrics["debug/tis_mask_frac_kept"] = float(frac_kept)
+                if dppo_enabled:
+                    dppo_frac_kept = (
+                        dppo_mask_kept_tokens / dppo_mask_total_tokens
+                        if dppo_mask_total_tokens > 0
+                        else torch.zeros((), device=device)
+                    )
+                    self.local_metrics["debug/dppo_mask_frac_kept"] = float(dppo_frac_kept)
+                if tvpo_enabled:
+                    tvpo_frac_kept = (
+                        tvpo_mask_kept_tokens / tvpo_mask_total_tokens
+                        if tvpo_mask_total_tokens > 0
+                        else torch.zeros((), device=device)
+                    )
+                    self.local_metrics["debug/tvpo_mask_frac_kept"] = float(tvpo_frac_kept)
+                    tvpo_tv = (
+                        tvpo_tv_weighted_sum / tvpo_tv_weight if tvpo_tv_weight > 0 else torch.zeros((), device=device)
+                    )
+                    self.local_metrics["actor/ppo_tv"] = float(tvpo_tv)
+                if grad_norms:
+                    self.local_metrics["optim/grad_norm"] = sum(grad_norms) / len(grad_norms)
                 array_metrics = {}
                 for key, value in batch_metrics.items():
                     if value is None:
@@ -709,6 +1497,49 @@ class PolicyTrainerRayProcess(RayProcess):
                     else:
                         array_metrics[key] = value
                 return self.local_metrics.get_metrics_list(), array_metrics
+
+    def dummy_optimizer_step(self) -> None:
+        """Run one zero-loss optimizer step to initialize ZeRO-3's internal NCCL
+        communicators and parameter-partition pointers before setup_model_update_group
+        is called.  Loss is multiplied by 0 so autograd gradients are zero;
+        the optimizer still fires (advancing momentum/variance slightly) but weight
+        changes should be negligible before the immediate vLLM sync.
+
+        After the step we invalidate ZeRO-3's parameter-fetch trace so that the
+        first real training step (which may use different code paths, e.g. the
+        Qwen3.5 hybrid packing patch) re-records a fresh trace rather than
+        replaying the one built from the dummy 2-token input."""
+        device = next(self.model.parameters()).device
+        dummy_ids = torch.ones(1, 2, dtype=torch.long, device=device)
+        output = self.model(input_ids=dummy_ids, labels=dummy_ids)
+        self.model.backward(output.loss * 0.0)
+        self.model.step()
+        # Invalidate the ZeRO-3 parameter prefetch trace recorded by the dummy
+        # forward so the first real training step builds its own correct trace.
+        if hasattr(self.model, "optimizer") and hasattr(self.model.optimizer, "parameter_offload"):
+            coord = self.model.optimizer.parameter_offload.get_param_coordinator()
+            coord._invalidate_trace()
+
+    def _save_value_model(self, output_dir: str | pathlib.Path) -> None:
+        """Save value model weights to output_dir/value_model.bin. All ranks must call this."""
+        assert self.value_model is not None
+        value_to_save = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
+        out_path = pathlib.Path(output_dir)
+        if self.args.deepspeed_stage == 3:
+            if hasattr(value_to_save, "ds_active_sub_modules"):
+                value_to_save.ds_active_sub_modules.clear()
+            gathered: dict[str, torch.Tensor] = {}
+            for key, value in value_to_save.named_parameters():
+                params_to_fetch = _z3_params_to_fetch([value])
+                with deepspeed.zero.GatheredParameters(params_to_fetch, enabled=len(params_to_fetch) > 0):
+                    if self.rank == 0:
+                        gathered[key] = value.data.detach().cpu()
+            if self.rank == 0:
+                out_path.mkdir(parents=True, exist_ok=True)
+                torch.save(gathered, out_path / "value_model.bin")
+        elif self.rank == 0:
+            out_path.mkdir(parents=True, exist_ok=True)
+            torch.save(value_to_save.state_dict(), out_path / "value_model.bin")
 
     def save_checkpoint_state(self, checkpoint_state_dir: str, client_state: dict[str, Any]) -> None:
         args = self.args
@@ -747,6 +1578,13 @@ class PolicyTrainerRayProcess(RayProcess):
                 logger.info(f"Saved reference policy model to {ref_policy_dir}")
 
             client_state["ref_policy_saved"] = True
+
+        if self.args.use_value_model and self.value_model is not None:
+            value_dir = os.path.join(checkpoint_state_dir, "value_model")
+            self._save_value_model(value_dir)
+            if self.rank == 0:
+                logger.info(f"Saved value model to {value_dir}")
+            client_state["value_model_saved"] = True
 
         # Save the main model checkpoint with enhanced client state
         # mpu is just used for sequence parallel, so we remove it for saving, and then re-add it after.
@@ -838,6 +1676,9 @@ class PolicyTrainerRayProcess(RayProcess):
 
             self.tokenizer.save_pretrained(output_dir)
             marker_path.touch()
+
+        if self.args.use_value_model and self.value_model is not None:
+            self._save_value_model(output_path / "value_model")
 
     # we need this because we don't know which node is rank 0 is on
     def launch_ai2_evals_on_weka_wrapper(self, step_dir, leaderboard_name, wandb_url, training_step):
@@ -994,6 +1835,7 @@ def setup_runtime_variables(
         args.hf_repo_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}"
     if args.with_tracking and args.wandb_entity is None:
         args.wandb_entity = maybe_use_ai2_wandb_entity()
+    streaming_config.use_value_model = args.use_value_model
     return args
 
 
@@ -1008,8 +1850,8 @@ def setup_experiment_tracking(
     all_configs = {}
     if (beaker_config := maybe_get_beaker_config()) is not None:
         all_configs.update(vars(beaker_config))
-    all_configs.update(**asdict(args), **asdict(tc), **asdict(model_config), **asdict(streaming_config))
-    all_configs.update(**asdict(vllm_config))
+    for config in (args, tc, model_config, streaming_config, vllm_config):
+        all_configs.update(asdict(config))
 
     wandb_url = None
     if args.with_tracking:
@@ -1160,6 +2002,10 @@ def create_tool_pools(
 
         for cfg, call_name, tool_class in configs_to_create:
             kwargs = asdict(cfg) | {"call_name": call_name}
+            # Pre-resolve HF dataset so each actor skips the redundant download.
+            hf_repo = kwargs.get("task_data_hf_repo")
+            if hf_repo and not kwargs.get("task_data_dir") and hasattr(tool_class, "resolve_task_data_dir"):
+                kwargs["task_data_dir"] = tool_class.resolve_task_data_dir(hf_repo)
             pools[call_name] = EnvironmentPool.remote(pool_size=pool_size, actor_class=tool_class, **kwargs)
             tool_call_names.append(call_name)
 
@@ -1237,6 +2083,24 @@ def create_model_and_optimizer(
     # Get model_dims early from HuggingFace config (doesn't require vLLM)
     model_dims = utils.ModelDims.from_hf_config(model_config.model_name_or_path)
 
+    image_prewarm_actors = []
+    if os.getenv("SWERL_DOCKER_PREWARM_ENABLED", "").strip().lower() not in {"", "0", "false", "no", "off"}:
+        for node in ray.nodes():
+            if not node.get("Alive", False):
+                continue
+            node_ip = node.get("NodeManagerAddress")
+            if not node_ip:
+                continue
+            try:
+                image_prewarm_actors.append(
+                    data_loader_lib.ImagePrewarmActor.options(
+                        num_cpus=0.1, resources={f"node:{node_ip}": 0.001}
+                    ).remote()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create ImagePrewarmActor on node {node_ip}: {e}")
+        logger.info(f"Created {len(image_prewarm_actors)} ImagePrewarmActor(s)")
+
     # Create DataPreparationActor FIRST so StreamingDataLoader can find it
     _data_prep_actor = data_loader_lib.DataPreparationActor.options(
         name=data_loader_lib.DATA_PREP_ACTOR_NAME, num_cpus=2
@@ -1262,6 +2126,7 @@ def create_model_and_optimizer(
         model_name=model_config.model_name_or_path,
         initial_state=None,
         base_env_config=base_env_config,
+        image_prewarm_actors=image_prewarm_actors,
     )
 
     # Create policy group and start model loading BEFORE vLLM engines (matches main branch order).
@@ -1314,35 +2179,35 @@ def create_model_and_optimizer(
         eval_results_queue=evaluation_inference_results_Q,
         actor_manager=actor_manager,
         inflight_updates=streaming_config.inflight_updates,
+        inflight_updates_recompute_kv_cache=streaming_config.inflight_updates_recompute_kv_cache,
         reward_config=reward_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         vllm_attention_backend=vllm_config.vllm_attention_backend,
+        vllm_gdn_prefill_backend=vllm_config.vllm_gdn_prefill_backend,
+        lm_head_fp32=args.lm_head_fp32,
     )
     logger.info("======== ✅ vLLM engines and actor_manager initialized =========")
 
-    if vllm_engines:
-        kv_cache_max_concurrency = ray.get(vllm_engines[0].get_kv_cache_info.remote())
-        ray.get(actor_manager.set_kv_cache_max_concurrency.remote(kv_cache_max_concurrency))
-        expected_batch_size = (
+    kv_cache_max_concurrency = ray.get(vllm_engines[0].get_kv_cache_info.remote())
+    ray.get(actor_manager.set_kv_cache_max_concurrency.remote(kv_cache_max_concurrency))
+    expected_batch_size = (
+        streaming_config.num_unique_prompts_rollout
+        * streaming_config.num_samples_per_prompt_rollout
+        // vllm_config.vllm_num_engines
+    )
+    if kv_cache_max_concurrency < expected_batch_size:
+        nodes_needed = math.ceil(
             streaming_config.num_unique_prompts_rollout
             * streaming_config.num_samples_per_prompt_rollout
-            // vllm_config.vllm_num_engines
+            / kv_cache_max_concurrency
         )
-        if kv_cache_max_concurrency < expected_batch_size:
-            nodes_needed = math.ceil(
-                streaming_config.num_unique_prompts_rollout
-                * streaming_config.num_samples_per_prompt_rollout
-                / kv_cache_max_concurrency
-            )
-            logger.warning(
-                f"kv_cache_max_concurrency ({kv_cache_max_concurrency}) is lower than "
-                f"num_unique_prompts_rollout * num_samples_per_prompt_rollout // vllm_num_engines ({expected_batch_size}). "
-                f"This means actors will have to run multiple sequential batches, hurting performance. "
-                f"You might want to use more inference nodes ({nodes_needed} nodes to generate the entire batch simultaneously)."
-            )
-    else:
-        ray.get(actor_manager.set_kv_cache_max_concurrency.remote(-1))
+        logger.warning(
+            f"kv_cache_max_concurrency ({kv_cache_max_concurrency}) is lower than "
+            f"num_unique_prompts_rollout * num_samples_per_prompt_rollout // vllm_num_engines ({expected_batch_size}). "
+            f"This means actors will have to run multiple sequential batches, hurting performance. "
+            f"You might want to use more inference nodes ({nodes_needed} nodes to generate the entire batch simultaneously)."
+        )
 
     # Wait for policy models to finish loading
     results, _ = ray_get_with_progress(inits, desc="Initializing models")
@@ -1364,14 +2229,6 @@ def create_model_and_optimizer(
             "Restored data prep actor state from checkpoint "
             f"with training_step={data_prep_actor_state['training_step']}"
         )
-
-    ray_get_with_progress([_data_prep_actor.start.remote()], desc="Starting data prep actor")
-
-    ray_get_with_progress(
-        [m.setup_model_update_group.remote(vllm_engines=vllm_engines) for m in policy_group.models],
-        desc="Setting up model update group",
-    )
-    logger.info("======== ✅ model update group setup successfully =========")
 
     return (
         policy_group,
@@ -1455,28 +2312,30 @@ def weight_sync_thread(
         # Clear the event for next iteration
         target_model_step = weight_sync_trigger.get_step_and_clear()
 
-        with Timer("[Weight Sync]") as timer:
-            logger.debug("[Weight Sync Thread] Starting weight sync")
+        try:
+            with Timer("[Weight Sync]") as timer:
+                logger.debug("[Weight Sync Thread] Starting weight sync")
 
-            # Set actors to stop
-            ray.get(actor_manager.set_should_stop.remote(True))
-            logger.debug("[Weight Sync Thread] Set should_stop to True for weight sync")
+                # Set actors to stop
+                ray.get(actor_manager.set_should_stop.remote(True))
+                logger.debug("[Weight Sync Thread] Set should_stop to True for weight sync")
 
-            # Broadcast weights to vLLM engines
-            # First get the futures
-            weight_broadcast_futures: list[ray.ObjectRef] = [m.broadcast_to_vllm.remote() for m in policy_group.models]
+                # Broadcast weights to vLLM engines
+                # First get the futures
+                weight_broadcast_futures: list[ray.ObjectRef] = [
+                    m.broadcast_to_vllm.remote() for m in policy_group.models
+                ]
 
-            # Wait for all trainer-side broadcasts to finish and collect timing stats.
-            # NOTE: these results are lists of engine.update_weight ObjectRefs (empty on non-rank-0 workers).
-            weight_broadcast_results, actor_sync_times = ray_get_with_progress(
-                weight_broadcast_futures,
-                desc="[Weight Sync Thread] Waiting for weight updates to complete",
-                enable=args.verbose,
-            )
+                # Wait for all trainer-side broadcasts to finish and collect timing stats.
+                # NOTE: these results are lists of engine.update_weight ObjectRefs (empty on non-rank-0 workers).
+                weight_broadcast_results, actor_sync_times = ray_get_with_progress(
+                    weight_broadcast_futures,
+                    desc="[Weight Sync Thread] Waiting for weight updates to complete",
+                    enable=args.verbose,
+                )
 
-            if not inflight_updates:
-                # Ensure all vLLM engine update RPCs have completed before unpausing actors.
-                # Without waiting here, should_stop may flip to False while updates are still queued.
+                # Always wait for vLLM's update RPCs before resuming generation. In-flight
+                # updates only skip draining active requests before the pause/update.
                 engine_update_refs = [ref for refs in weight_broadcast_results for ref in refs]
                 if engine_update_refs:
                     ray_get_with_progress(
@@ -1485,7 +2344,15 @@ def weight_sync_thread(
                         enable=False,
                     )
 
-            # Allow actors to resume
+                ray_get_with_progress(
+                    [engine.wake_up.remote() for engine in vllm_engines],
+                    desc="[Weight Sync Thread] Waking up vLLM engines",
+                    enable=False,
+                )
+        except Exception as e:
+            logger.exception("[Weight Sync Thread] Weight Sync failed")
+            raise RuntimeError from e
+        finally:
             ray.get(actor_manager.set_should_stop.remote(False))
             logger.debug("[Weight Sync Thread] Set should_stop to False after weight sync")
 
@@ -1529,18 +2396,18 @@ def one_training_step(
     chat_template_name: str,
     model_dims: utils.ModelDims,
     actor_manager: ActorManager | None = None,
-) -> int:
-    """Train the model for one step. Returns the number of tokens processed."""
+) -> tuple[int, int]:
+    """Train the model for one step. Returns tokens processed and the updated episode count."""
     update_ref_policy_future = []
     with Timer("[Main Thread] 🗡️ Training") as train_timer:
         results, _ = ray_get_with_progress(
-            [policy_group.models[i].step.remote() for i in range(args.world_size)],
+            [policy_group.models[i].step.remote(training_step) for i in range(args.world_size)],
             desc=f"Running training step {training_step}",
         )
         metrics, array_metrics = zip(*results)
         if all(len(m) == 0 for m in metrics):
             logger.warning("[Main Thread] 🤡 After packing, there is not enough data to train")
-            return 0
+            return 0, episode
         if (
             args.load_ref_policy
             and args.ref_policy_update_freq is not None
@@ -1572,6 +2439,10 @@ def one_training_step(
         "policy/entropy_avg",
         "val/ratio",
         "val/ratio_var",
+        "debug/tis_mask_frac_kept",
+        "debug/dppo_mask_frac_kept",
+        "debug/tvpo_mask_frac_kept",
+        "actor/ppo_tv",
     }
     average_metrics = {}
     # Average scalar metrics from each worker
@@ -1590,6 +2461,7 @@ def one_training_step(
         average_metrics[k] = v
     step_time = time.perf_counter() - start_time
     total_training_time = time.perf_counter() - training_start_time
+    episode += _count_sampled_episodes_for_step(streaming_config, average_metrics)
 
     total_generation_time = average_metrics["time/getting_response"]
     prompt_lengths = array_metrics[0]["batch/prompt_lengths"]
@@ -1629,6 +2501,10 @@ def one_training_step(
     print_rich_single_line_metrics(scalar_metrics)
 
     if args.with_tracking:
+        # Convert evolving rubric table data to wandb.Table
+        if RUBRIC_TABLE_KEY in metrics and isinstance(metrics[RUBRIC_TABLE_KEY], list):
+            metrics[RUBRIC_TABLE_KEY] = wandb.Table(columns=RUBRIC_TABLE_COLUMNS, data=metrics[RUBRIC_TABLE_KEY])
+
         # Convert array/list metrics to wandb histograms for logging.
         metrics_to_log = {}
         for key, value in metrics.items():
@@ -1638,7 +2514,7 @@ def one_training_step(
                 metrics_to_log[key] = value
         wandb.log(metrics_to_log, step=training_step)
 
-    return num_step_tokens
+    return num_step_tokens, episode
 
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3)
@@ -1850,6 +2726,12 @@ def cleanup_training_resources(
     """Clean up all training resources including threads and Ray queues."""
     stop_event.set()
 
+    try:
+        data_prep_actor = ray.get_actor(data_loader_lib.DATA_PREP_ACTOR_NAME)
+        ray.kill(data_prep_actor)
+    except (ray.exceptions.RayError, ValueError) as e:
+        logger.warning(f"Could not shut down DataPreparationActor: {e}")
+
     logger.info("Signaling all actors to stop...")
     ray.get(actor_manager.set_should_stop.remote(True))
     logger.info("✅ Signaled all actors to stop")
@@ -1935,25 +2817,8 @@ def run_training(
         )
         logger.info("Restored dataloader state from checkpoint")
 
-    logger.info("======== ✅ weight sync thread starts =========")
-    weight_sync_trigger = WeightSyncTrigger()
-    initial_model_step = resume_training_step - 1
-    ray_get_with_progress(
-        [engine.set_model_step.remote(initial_model_step) for engine in vllm_engines],
-        desc=f"Initializing vLLM model step to {initial_model_step}",
-    )
-    weight_sync_thread_future = executor.submit(
-        weight_sync_thread,
-        args,
-        stop_event,
-        weight_sync_trigger,
-        policy_group,
-        vllm_engines,
-        actor_manager,
-        weight_sync_metrics_Q,
-        resume_training_step,
-        streaming_config.inflight_updates,
-    )
+    weight_sync_trigger: WeightSyncTrigger | None = None
+    weight_sync_thread_future: futures.Future | None = None
 
     """Run the main training loop with worker threads."""
     ray_get_with_progress(
@@ -1962,11 +2827,17 @@ def run_training(
 
     logger.info("======== ✅ Dataloaders already initialized in actors =========")
 
-    def health_check_fn():
-        [f.result() for f in [weight_sync_thread_future] if f.done()]
-        # Wait for weight sync to complete (should_stop becomes False)
+    def health_check_fn(weight_sync_future: futures.Future | None, expect_new_weight_sync: bool = False):
+        seen_actors_paused = False
         start = time.perf_counter()
-        while ray.get(actor_manager.should_stop.remote()):
+        while True:
+            if weight_sync_future is not None and weight_sync_future.done():
+                weight_sync_future.result()
+            should_stop = ray.get(actor_manager.should_stop.remote())
+            if should_stop:
+                seen_actors_paused = True
+            if not should_stop and (not expect_new_weight_sync or seen_actors_paused):
+                break
             if time.perf_counter() - start > WEIGHT_SYNC_TIMEOUT_S:
                 raise RuntimeError(f"Weight sync timed out after {WEIGHT_SYNC_TIMEOUT_S}s - vLLM engines may be stuck")
             time.sleep(0.1)
@@ -1976,11 +2847,57 @@ def run_training(
             enable=False,
         )
 
+    def initialize_weight_sync() -> tuple[futures.Future, WeightSyncTrigger]:
+        logger.info("[Main Thread] Initializing native vLLM weight sync.")
+
+        ray_get_with_progress(
+            [m.setup_model_update_group.remote(vllm_engines=vllm_engines) for m in policy_group.models],
+            desc="Setting up model update group",
+        )
+        logger.info("======== ✅ model update group setup successfully =========")
+
+        logger.info("======== ✅ weight sync thread starts =========")
+        trigger = WeightSyncTrigger()
+        ray_get_with_progress(
+            [engine.set_model_step.remote(0) for engine in vllm_engines], desc="Initializing vLLM model step to 0"
+        )
+        future = executor.submit(
+            weight_sync_thread,
+            args,
+            stop_event,
+            trigger,
+            policy_group,
+            vllm_engines,
+            actor_manager,
+            weight_sync_metrics_Q,
+            1,
+            streaming_config.inflight_updates,
+        )
+
+        logger.info("[Main Thread] Triggering initial native vLLM weight sync.")
+        trigger.notify(step=resume_training_step)
+        health_check_fn(future, expect_new_weight_sync=True)
+        return future, trigger
+
     if checkpoint_state and "num_total_tokens" in checkpoint_state:
         num_total_tokens = checkpoint_state["num_total_tokens"]
         logger.info(f"Restored num_total_tokens: {num_total_tokens}")
     else:
         num_total_tokens = 0
+
+    # With DeepSpeed ZeRO-3 the model-update NCCL group must not be initialised
+    # before the first optimizer step — doing so causes GatheredParameters to
+    # broadcast NaN weights to vLLM.
+    #
+    # Always use this path for ZeRO-3 so setup_model_update_group runs before
+    # data prep starts generating with vLLM/tool actors. This avoids initializing
+    # the trainer<->vLLM NCCL group while sandbox Docker work is already active.
+    _data_prep_actor = ray.get_actor(data_loader_lib.DATA_PREP_ACTOR_NAME)
+    if args.deepspeed_stage == 3:
+        logger.info("[Main Thread] ZeRO-3: running dummy optimizer step to prime NCCL state.")
+        ray_get_with_progress([m.dummy_optimizer_step.remote() for m in policy_group.models], desc="ZeRO-3 dummy step")
+        weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
+    ray_get_with_progress([_data_prep_actor.start.remote()], desc="Starting data prep actor")
 
     if eval_dataset is not None:
         eval_data_loader = data_loader_lib.HFDataLoader(
@@ -2008,7 +2925,7 @@ def run_training(
 
         # Check if any of the threads have raised an exception.
         health_check_start = time.perf_counter()
-        health_check_fn()
+        health_check_fn(weight_sync_thread_future)
         health_check_time = time.perf_counter() - health_check_start
 
         if (
@@ -2035,8 +2952,6 @@ def run_training(
                 )
             eval_data_loader.reset()
 
-        episode += streaming_config.num_unique_prompts_rollout * streaming_config.num_samples_per_prompt_rollout
-
         data_thread_metrics = {}
         try:
             data_thread_metrics |= weight_sync_metrics_Q.get_nowait()
@@ -2045,7 +2960,7 @@ def run_training(
 
         data_thread_metrics["time/health_check"] = health_check_time
 
-        num_step_tokens = one_training_step(
+        num_step_tokens, episode = one_training_step(
             args,
             streaming_config,
             policy_group,
@@ -2096,8 +3011,14 @@ def run_training(
                 )
                 logger.info(f"Saved checkpoint state at step {training_step} to {args.checkpoint_state_dir}")
 
-        logger.debug(f"[Main Thread] Triggered weight sync for step {training_step}")
-        weight_sync_trigger.notify(step=training_step)
+        if weight_sync_trigger is not None:
+            logger.debug(f"[Main Thread] Triggered weight sync for step {training_step}")
+            weight_sync_trigger.notify(step=training_step)
+        elif training_step == resume_training_step:
+            # Non-ZeRO-3 runs initialise weight sync after the first training
+            # step. ZeRO-3 is handled pre-loop via a dummy step, so
+            # weight_sync_trigger is already set in that case.
+            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
 
         last_eval_collected = maybe_evaluate(
             args,
@@ -2313,6 +3234,8 @@ def main(
     pool_size = tools_config.pool_size
     if pool_size is None:
         pool_size = streaming_config.num_unique_prompts_rollout * streaming_config.num_samples_per_prompt_rollout
+    if args.cache_dataset_only:
+        pool_size = 1
     logger.info(f"Pool size per tool: {pool_size}")
 
     pools, tool_definitions, tool_stop_sequences = initialize_tools_and_envs(
@@ -2347,6 +3270,12 @@ def main(
         return
 
     utils.ensure_hf_repo_cached(model_config.model_name_or_path, revision=model_config.model_revision)
+    if (
+        args.use_value_model
+        and args.value_model_name_or_path is not None
+        and args.value_model_name_or_path != model_config.model_name_or_path
+    ):
+        utils.ensure_hf_repo_cached(args.value_model_name_or_path)
     if tc.tokenizer_name_or_path and tc.tokenizer_name_or_path != model_config.model_name_or_path:
         utils.ensure_hf_repo_cached(tc.tokenizer_name_or_path, revision=tc.tokenizer_revision)
 

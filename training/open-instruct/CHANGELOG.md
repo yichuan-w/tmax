@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 
 ### Changed
+- Fix Qwen3.5 packing logprob mismatch: call `patch_qwen3_5_packing()` inside `PolicyTrainerRayProcess.from_pretrained()` so the GatedDeltaNet sequence-isolation patch is applied in the Ray worker process, not only in the main process. Without this, packed rows leaked state between sub-sequences, causing `vllm_vs_local_logprob_diff_mean` ~0.21 instead of the expected ~0.02.
+- Build FLA CP context per-batch with `fla.ops.cp.build_cp_context` so Qwen3.5 hybrid linear-attention correctly starts fresh state for packed sub-sequences that don't cross Ulysses SP rank boundaries; threads un-sharded `global_position_ids` through `UlyssesSPSplitter` → `CollatedBatchData` → `compute_logprobs` / `forward_for_logprobs`.
+- Pass `attention_mask=None` in GRPO `forward_for_logprobs` calls — HF constructs the correct 3D intra-document mask from `position_ids` internally (https://github.com/allenai/open-instruct/pull/1617).
+- Migrate GRPO trainer→vLLM weight sync to vLLM 0.16.0's native weight transfer API (`NCCLWeightTransferEngine`), replacing custom NCCL process-group and broadcast code (https://github.com/allenai/open-instruct/pull/1515).
+- Extend pre-commit hook to also ban `nonlocal` keyword (https://github.com/allenai/open-instruct/pull/1613).
 - Set checkpoint_state_freq default in data_loader.py, not mason.py (https://github.com/allenai/open-instruct/pull/1600).
 - Inline data prep actor naming in `StreamingDataLoader` and GRPO, removing redundant helpers and parameter plumbing (https://github.com/allenai/open-instruct/pull/1326).
 - Use local fixture for AceCode test instead of downloading from HuggingFace (https://github.com/allenai/open-instruct/pull/1593).
@@ -17,6 +22,16 @@ All notable changes to this project will be documented in this file.
 - Add deprecation warning to `finetune.py` pointing users to the OLMo-core SFT implementation (https://github.com/allenai/open-instruct/pull/1574).
 
 ### Fixed
+- Fix `DataPreparationActor` hanging on shutdown by killing the actor with `ray.kill()` during cleanup (https://github.com/allenai/open-instruct/pull/1611).
+- Fix empty optimizer group error with torch 2.10 and DeepSpeed in `finetune.py`, `dpo_tune_cache.py`, and `utils.py`. (https://github.com/allenai/open-instruct/pull/1598)
+- Fix `DatasetTransformationCache.load_or_transform_dataset` return type to match expected tuple unpacking. (https://github.com/allenai/open-instruct/pull/1598)
+- Fix DeepSpeed gradient clipping in `grpo_fast.py` by passing `max_norm` to the DS config. (https://github.com/allenai/open-instruct/pull/1598)
+- Fix `dpo_tune_cache.py` logging on every rank. (https://github.com/allenai/open-instruct/pull/1598)
+- Fix `truncate_messages_to_fit_context` double-counting system tokens, which under-filled the judge context window by `system_tokens` worth of space (https://github.com/allenai/open-instruct/pull/1601).
+- Fix `is_equiv` returning `None` instead of `False` when expression simplification raises `ValueError` (https://github.com/allenai/open-instruct/pull/1605).
+- Fix off-by-one in `find_shared_text` so the full shared prefix is returned when one string is a prefix of another, and handle empty-input cases (https://github.com/allenai/open-instruct/pull/1604).
+- Fix `PreferenceDatasetProcessor.filter` dropping the rejected-sequence length check, so over-long rejected completions were no longer filtered (https://github.com/allenai/open-instruct/pull/1597).
+- Fix dataset validation logic that rejected `--dataset_name` as the sole dataset mechanism in DPO and finetuning configs (https://github.com/allenai/open-instruct/pull/1595).
 - Improve GRPO vLLM timeout handling: retry `_check_health` on `TimeoutError` and ensure `set_should_stop` is always reset in the weight sync thread to prevent training hangs (https://github.com/allenai/open-instruct/pull/1532).
 - Fix `Batch.__getitem__` handling of `active_tools` for int and list indexing (https://github.com/allenai/open-instruct/pull/1592).
 - Fix `RepeatPhraseChecker.check_following` to validate all matched phrases differ by exactly one word and return a proper boolean instead of `None` (https://github.com/allenai/open-instruct/pull/1044).
@@ -25,7 +40,11 @@ All notable changes to this project will be documented in this file.
 - Add `--no_auto_dataset_cache` to GRPO and SFT integration test scripts to avoid HuggingFace 504 timeouts on CI runner (https://github.com/allenai/open-instruct/pull/1571).
 
 ### Added
+- Add TVPO (Total-Variation Proximal Policy Optimization) loss to `grpo_fast.py` and `olmo_core_train_modules.py`: a prompt-level TV trust region that aggregates `(1/2)·E[|π_θ/μ_θ' − 1|]` across all rollouts of the same prompt. When every prompt is in budget the mask is all-ones (full REINFORCE-IS step); when over budget, blocked tokens have their loss replaced by its detached value so no gradient flows but the loss value is preserved for logging. Adds a `policy_freeze_mask` channel to `compute_grpo_loss` (substitution-based gating, distinct from DPPO's multiplicative `tis_weights` mask). Configurable via `--loss_fn tvpo`, `--tvpo_divergence_threshold`, and `--tvpo_truncation_cap`. Logs `actor/ppo_tv` and `debug/tvpo_mask_frac_kept`.
+- Add Divergence Proximal Policy Optimization (DPPO) loss to `grpo_fast.py` and `olmo_core_train_modules.py`: replaces PPO's per-token ratio clipping with a binary (Bernoulli) TV/KL trust-region mask anchored on the rollout policy μ_θ' (https://arxiv.org/abs/2602.04879). Configurable via `--loss_fn dppo`, `--dppo_divergence_type {tv,kl}`, and `--dppo_divergence_threshold`. Also adds `debug/dppo_mask_frac_kept` and fixes `debug/tis_mask_frac_kept` to be correctly token-weighted across all samples in a batch instead of being overwritten per sample.
 - Add `SWERLSandboxEnv` for per-sample Docker tasks with submit-based evaluation. Extends `RLEnvironment` directly with `execute_bash`, `str_replace_editor`, and `submit` tools. Each task provides its own instruction, seed files, and test scripts via a task data directory. Includes 1-GPU and 8-GPU debug scripts (https://github.com/allenai/open-instruct/pull/1492).
+- Add MiniMax provider support: register `minimax-m2.7` and `minimax-m2.7-highspeed` models in `PRICE_PER_TOKEN` for cost tracking and add cl100k_base encoding support in `context_window_checker` (https://github.com/allenai/open-instruct/pull/1602).
+- Wire evolving rubric config flags into the GRPO training loop so `apply_evolving_rubric_reward` actually triggers rubric generation, buffer management, and ground-truth overrides during training (https://github.com/allenai/open-instruct/pull/1581).
 - Add model step logging for GRPO/vLLM by propagating `model_step` through generation metadata/results, syncing vLLM engines to the latest training step after weight sync, and reporting `model_step_min/max/mean` reward metrics (https://github.com/allenai/open-instruct/pull/1508).
 - Add Qwen3.5 VLM-as-CausalLM support for GRPO, SFT, and DPO: `language_model_only` for vLLM, param name mapping for weight sync, VLM config handling, liger-kernel bump to 0.7.0, pre-download model on rank 0 to avoid HF cache race conditions, update vllm to 0.19.0, and fix Ulysses SP for VLM models by passing the model object to `register_with_transformers` (https://github.com/allenai/open-instruct/pull/1568).
 - Add OLMo-core sharding and parallelism documentation covering HSDP configuration across DPO, GRPO, and SFT (https://github.com/allenai/open-instruct/pull/1582).

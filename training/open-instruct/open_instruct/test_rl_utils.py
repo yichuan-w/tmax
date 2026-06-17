@@ -1,3 +1,5 @@
+import json
+import os
 import shutil
 import tempfile
 import time
@@ -8,7 +10,7 @@ import torch
 import transformers
 from parameterized import parameterized
 
-from open_instruct import rl_utils
+from open_instruct import rl_utils, value_model_utils
 
 PACK_LENGTH = 40
 PROMPT_MAX_LEN = 20
@@ -95,6 +97,19 @@ class TestRLUtils(unittest.TestCase):
 
         self.assertEqual(result, "done")
 
+    def test_value_clipped_mse_loss(self):
+        new_values = torch.tensor([[1.0, 2.5, 3.0]])
+        returns = torch.tensor([[1.0, 3.0, 4.0]])
+        old_values = torch.tensor([[1.0, 2.0, 3.0]])
+        mask = torch.tensor([[True, True, False]])
+
+        per_token, clipfrac = value_model_utils.value_clipped_mse_loss(
+            new_values=new_values, returns=returns, old_values=old_values, mask=mask, clip_range=0.2
+        )
+
+        torch.testing.assert_close(per_token, torch.tensor([[0.0, 0.64, 0.0]]))
+        torch.testing.assert_close(clipfrac, torch.tensor(0.5))
+
     def test_pack_sequences(self):
         """Test that pack_sequences correctly concatenates queries and responses into packed format."""
         queries, responses, pad_token_id = get_test_data()
@@ -148,6 +163,8 @@ class TestRLUtils(unittest.TestCase):
             pack_length=8,
             pad_token_id=pad_token_id,
             vllm_logprobs=vllm_logprobs,
+            rollout_sample_ids=[7, 9],
+            model_steps=[3, 4],
             mask_tool_use=mask_tool_use,
         )
 
@@ -156,6 +173,96 @@ class TestRLUtils(unittest.TestCase):
         self.assertEqual(packed.response_masks[1].dtype, torch.long)
         torch.testing.assert_close(packed.response_masks[0].bool(), torch.tensor(expected_mask_0, dtype=torch.bool))
         torch.testing.assert_close(packed.response_masks[1].bool(), torch.tensor(expected_mask_1, dtype=torch.bool))
+        self.assertIsNotNone(packed.prompt_masks)
+        self.assertIsNotNone(packed.rollout_sample_ids)
+        torch.testing.assert_close(
+            packed.prompt_masks[0].bool(), torch.tensor([True, True, True, False, False, False])
+        )
+        torch.testing.assert_close(packed.prompt_masks[1].bool(), torch.tensor([True, True, False, False]))
+        torch.testing.assert_close(packed.rollout_sample_ids[0], torch.tensor([7, 7, 7, 7, 7, 7]))
+        torch.testing.assert_close(packed.rollout_sample_ids[1], torch.tensor([9, 9, 9, 9]))
+        self.assertIsNotNone(packed.model_steps)
+        torch.testing.assert_close(packed.model_steps[0], torch.tensor([3, 3, 3, 3, 3, 3]))
+        torch.testing.assert_close(packed.model_steps[1], torch.tensor([4, 4, 4, 4]))
+
+    def test_save_trainer_logprobs_includes_token_metadata(self):
+        trainer_logprobs = [torch.tensor([[0.1, 0.2, 0.3, 0.4]])]
+        response_masks = [torch.tensor([[False, True, True, False]])]
+        input_token_ids = [torch.tensor([[11, 12, 13, 14, 0]])]
+        token_ids = [torch.tensor([[12, 13, 14, 0]])]
+        prompt_masks = [torch.tensor([[True, True, False, False]])]
+        attention_masks = [torch.tensor([[1, 1, 1, 0]])]
+        rollout_sample_ids = [torch.tensor([[5, 5, 5, -1]])]
+        model_steps = [torch.tensor([[9, 9, 9, -1]])]
+        vllm_logprobs = [torch.tensor([[0.0, -0.1, -0.2, float("nan")]])]
+
+        rl_utils._save_trainer_logprobs(
+            save_path=self.temp_dir,
+            run_name="test",
+            step=7,
+            trainer_logprobs=trainer_logprobs,
+            response_masks=response_masks,
+            sp_size=1,
+            trainer_model_step=8,
+            input_token_ids=input_token_ids,
+            token_ids=token_ids,
+            prompt_masks=prompt_masks,
+            attention_masks=attention_masks,
+            rollout_sample_ids=rollout_sample_ids,
+            model_steps=model_steps,
+            vllm_logprobs=vllm_logprobs,
+            rank=3,
+            world_size=8,
+            dp_rank=1,
+            sp_rank=1,
+        )
+
+        filepath = os.path.join(self.temp_dir, "test_trainer_logprobs_step000007_rank00003.jsonl")
+        with open(filepath) as f:
+            record = json.loads(f.readline())
+
+        self.assertEqual(record["rank"], 3)
+        self.assertEqual(record["world_size"], 8)
+        self.assertEqual(record["dp_rank"], 1)
+        self.assertEqual(record["sp_rank"], 1)
+        self.assertEqual(record["trainer_model_step"], 8)
+        self.assertEqual(record["model_step"], 9)
+        self.assertEqual(record["model_steps"], [9, 9, 9, -1])
+        self.assertEqual(record["trainer_logprobs_shape"], [1, 4])
+        self.assertEqual(record["input_token_ids"], [11, 12, 13, 14, 0])
+        self.assertEqual(record["token_ids"], [12, 13, 14, 0])
+        self.assertEqual(record["rollout_sample_ids"], [5, 5, 5, -1])
+        np.testing.assert_allclose(record["vllm_logprobs"][:3], [0.0, -0.1, -0.2])
+        self.assertEqual(record["prompt_mask"], [True, True, False, False])
+        self.assertEqual(
+            record["prompt_boundaries"],
+            [
+                {
+                    "row": 0,
+                    "sequence_id": 1,
+                    "sequence_start": 0,
+                    "prompt_start": 0,
+                    "prompt_end": 2,
+                    "sequence_end": 3,
+                    "rollout_sample_idx": 5,
+                }
+            ],
+        )
+
+        rl_utils._save_trainer_logprobs(
+            save_path=self.temp_dir,
+            run_name="single",
+            step=7,
+            trainer_logprobs=trainer_logprobs,
+            response_masks=response_masks,
+            sp_size=1,
+            rank=0,
+            world_size=1,
+        )
+        self.assertTrue(os.path.exists(os.path.join(self.temp_dir, "single_trainer_logprobs_step000007.jsonl")))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.temp_dir, "single_trainer_logprobs_step000007_rank00000.jsonl"))
+        )
 
     def test_calculate_advantages_packed(self):
         """Test that calculate_advantages_packed produces same results as unpacked version."""

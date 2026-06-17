@@ -948,10 +948,37 @@ def remove_dataset_source_field(dataset: Dataset) -> Dataset:
 
 TOOLS_COLUMN_KEY = "tools"
 ENV_CONFIG_KEY = "env_config"
+EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
 # Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v6: Added return_dict=False to apply_chat_template calls for transformers 5.x.
-DATASET_CACHE_VERSION = "v6"
+# to invalidate old caches. v10: Parse JSON-string tool schemas before templating.
+DATASET_CACHE_VERSION = "v11"
+
+
+def _normalize_tools_for_chat_template(tools: Any) -> list[dict[str, Any]] | None:
+    """Normalize dataset tool schemas before passing them to chat templates."""
+    if tools is None or tools == "":
+        return None
+
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{TOOLS_COLUMN_KEY} must be a JSON-encoded tool schema list, got: {tools!r}") from exc
+
+    if isinstance(tools, dict):
+        tools = [tools]
+
+    if not isinstance(tools, list):
+        raise TypeError(f"{TOOLS_COLUMN_KEY} must be a list, dict, JSON string, or None, got {type(tools).__name__}")
+
+    if not tools:
+        return None
+
+    if not all(isinstance(tool, dict) for tool in tools):
+        raise TypeError(f"{TOOLS_COLUMN_KEY} must contain JSON-schema dictionaries, got: {tools!r}")
+
+    return tools
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1097,12 +1124,11 @@ def sft_tokenize_mask_out_prompt_v1(
     return row
 
 
-def sft_filter_v1(
+def sft_length_and_label_filter_v1(
     row: dict[str, Any],
     tokenizer: PreTrainedTokenizer,
     max_prompt_token_length: int | None = None,
     max_token_length: int | None = None,
-    need_contain_labels: bool = True,
 ):
     max_prompt_token_length_ok = True
     if max_prompt_token_length is not None:
@@ -1113,14 +1139,14 @@ def sft_filter_v1(
         max_token_length_ok = len(row[INPUT_IDS_KEY]) <= max_token_length
 
     contain_some_labels = any(x != MASKED_TOKEN_VALUE for x in row[LABELS_KEY])
-    return max_prompt_token_length_ok and max_token_length_ok and (contain_some_labels or not need_contain_labels)
+    return max_prompt_token_length_ok and max_token_length_ok and contain_some_labels
 
 
 def mask_labels(
     labels: torch.Tensor,
     messages: list[dict[str, Any]],
     tokenizer: PreTrainedTokenizer,
-    max_seq_length: int,
+    max_seq_length: int | None,
     should_mask: Callable[[int, dict[str, Any], list[dict[str, Any]]], bool],
 ) -> None:
     """Mask spans in ``labels`` by setting them to -100.
@@ -1140,8 +1166,9 @@ def mask_labels(
         "return_dict": False,
         "padding": False,
         "truncation": max_seq_length is not None,
-        "max_length": max_seq_length,
     }
+    if max_seq_length is not None:
+        chat_template_kwargs["max_length"] = max_seq_length
 
     deferred_from_zero = False
     seen_user = False
@@ -1180,30 +1207,90 @@ def mask_labels(
             break
 
 
-def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+def _tokenize_tulu_sft_with_assistant_labels(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    tools: list[dict[str, Any]] | None,
+    max_seq_length: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rendered = tokenizer.apply_chat_template(
+        conversation=messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    tokenized = tokenizer(
+        rendered,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+        padding=False,
+        truncation=max_seq_length is not None,
+        max_length=max_seq_length,
+    )
+    input_ids = tokenized[INPUT_IDS_KEY]
+    attention_mask = tokenized[ATTENTION_MASK_KEY]
+    offsets = tokenized["offset_mapping"][0].tolist()
+    labels = torch.full_like(input_ids, MASKED_TOKEN_VALUE)
+
+    trainable_char_spans: list[tuple[int, int]] = []
+    for message_idx, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+
+        rendered_before = tokenizer.apply_chat_template(
+            conversation=messages[:message_idx],
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        rendered_through_message = tokenizer.apply_chat_template(
+            conversation=messages[: message_idx + 1],
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        if not rendered_through_message.startswith(rendered_before):
+            raise ValueError("Chat template rendering is not prefix-stable; cannot compute assistant label spans.")
+
+        assistant_text = rendered_through_message[len(rendered_before) :]
+        content_offset = assistant_text.find("\n")
+        if content_offset == -1:
+            content_offset = 0
+        else:
+            content_offset += 1
+        trainable_char_spans.append((len(rendered_before) + content_offset, len(rendered_through_message)))
+
+    for token_idx, (token_start, token_end) in enumerate(offsets):
+        if token_start == token_end:
+            continue
+        if any(span_start <= token_start and token_end <= span_end for span_start, span_end in trainable_char_spans):
+            labels[0, token_idx] = input_ids[0, token_idx]
+
+    return input_ids, attention_mask, labels
+
+
+def _sft_tulu_tokenize(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int | None):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
     messages = row["messages"]
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
-    input_ids_result = tokenizer.apply_chat_template(
-        conversation=messages,
-        tokenize=True,
-        return_tensors="pt",
-        return_dict=False,
-        padding=False,
-        truncation=True,
-        max_length=max_seq_length,
-        add_generation_prompt=False,
+    tools = _normalize_tools_for_chat_template(row.get(TOOLS_COLUMN_KEY))
+    input_ids, attention_mask, labels = _tokenize_tulu_sft_with_assistant_labels(
+        messages, tokenizer, tools, max_seq_length
     )
-    assert isinstance(input_ids_result, torch.Tensor)
-    input_ids = input_ids_result
-    labels = input_ids.clone()
-    mask_labels(labels, messages, tokenizer, max_seq_length, lambda idx, msg, _msgs: msg["role"] != "assistant")
-    attention_mask = torch.ones_like(input_ids)
     row[INPUT_IDS_KEY] = input_ids.flatten()
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
     return row
+
+
+def sft_tulu_tokenize_without_truncation_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
+    return _sft_tulu_tokenize(row, tokenizer, max_seq_length=None)
+
+
+def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+    return _sft_tulu_tokenize(row, tokenizer, max_seq_length=max_seq_length)
 
 
 def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
@@ -1211,8 +1298,10 @@ def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreT
     messages = row["messages"]
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
+    tools = _normalize_tools_for_chat_template(row.get(TOOLS_COLUMN_KEY))
     input_ids_result = tokenizer.apply_chat_template(
         conversation=messages,
+        tools=tools,
         tokenize=True,
         return_tensors="pt",
         return_dict=False,
@@ -1541,15 +1630,26 @@ def rlvr_max_length_filter_v2(
 TRANSFORM_FNS = {
     "sft_tokenize_v1": (sft_tokenize_v1, "map"),
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
-    "sft_filter_v1": (sft_filter_v1, "filter"),
+    "sft_length_and_label_filter_v1": (sft_length_and_label_filter_v1, "filter"),
+    "sft_tulu_tokenize_without_truncation_v1": (sft_tulu_tokenize_without_truncation_v1, "map"),
     "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
     "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
+    "last_turn_tulu_tokenize_and_truncate_v1": (last_turn_tulu_tokenize_and_truncate_v1, "map"),
     "preference_tokenize_v1": (preference_tokenize_v1, "map"),
     "preference_filter_v1": (preference_filter_v1, "filter"),
     "preference_tulu_tokenize_and_truncate_v1": (preference_tulu_tokenize_and_truncate_v1_2, "map"),
     "preference_tulu_filter_v1": (preference_tulu_filter_v1, "filter"),
     "rlvr_tokenize_v1": (rlvr_tokenize_v3, "map"),
     "rlvr_max_length_filter_v1": (rlvr_max_length_filter_v2, "filter"),
+}
+
+# SFT tokenization functions that consume the tools column — don't re-add it to target_columns
+_SFT_TOKENIZE_FNS = {
+    "sft_tokenize_v1",
+    "sft_tokenize_mask_out_prompt_v1",
+    "sft_tulu_tokenize_without_truncation_v1",
+    "sft_tulu_tokenize_and_truncate_v1",
+    "last_turn_tulu_tokenize_and_truncate_v1",
 }
 
 
@@ -1600,6 +1700,7 @@ class DatasetConfig:
     dataset_name: str
     dataset_split: str
     dataset_revision: str
+    dataset_config_name: str | None = None
     dataset_range: int | None = None
     transform_fn: list[str] = field(default_factory=list)
     transform_fn_args: list[dict[str, Any]] = field(default_factory=list)
@@ -1632,6 +1733,7 @@ class DatasetConfig:
             )
             dataset = load_dataset(
                 self.dataset_name,
+                self.dataset_config_name,
                 split=self.dataset_split,
                 revision=self.dataset_revision,
                 num_proc=max_num_processes(),
@@ -1738,7 +1840,9 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         target_columns = dataset.column_names if dc.target_columns is None else dc.target_columns
         # Always preserve dataset_source if it exists
         target_columns = _preserve_column(DATASET_ORIGIN_KEY, dataset, target_columns)
-        target_columns = _preserve_column(TOOLS_COLUMN_KEY, dataset, target_columns)
+        # Only preserve tools for RLVR transforms; SFT tokenization consumes tools and must not keep it
+        if fn_name not in _SFT_TOKENIZE_FNS:
+            target_columns = _preserve_column(TOOLS_COLUMN_KEY, dataset, target_columns)
         target_columns = _preserve_column(ENV_CONFIG_KEY, dataset, target_columns)
 
         if fn_type == "map":
@@ -1814,7 +1918,7 @@ class DatasetTransformationCache:
 
     def load_or_transform_dataset(
         self, dcs: list[DatasetConfig], tc: TokenizerConfig, dataset_skip_cache: bool = False
-    ) -> Dataset:
+    ) -> tuple[Dataset, dict[str, Any]]:
         """Load dataset from cache if it exists, otherwise transform and cache it."""
         repo_name = f"{self.hf_entity}/dataset-mix-cached"
 
@@ -1837,7 +1941,7 @@ class DatasetTransformationCache:
                 assert isinstance(loaded_dataset, Dataset)
                 if "index" not in loaded_dataset.column_names:
                     loaded_dataset = loaded_dataset.add_column("index", range(len(loaded_dataset)))
-                return loaded_dataset
+                return loaded_dataset, EMPTY_DATASET_STATISTICS.copy()
 
         print("Cache not found, transforming datasets...")
 
@@ -1853,7 +1957,7 @@ class DatasetTransformationCache:
             combined_dataset = combined_dataset.remove_columns("index")
         combined_dataset = combined_dataset.add_column("index", range(len(combined_dataset)))
         if dataset_skip_cache:
-            return combined_dataset
+            return combined_dataset, EMPTY_DATASET_STATISTICS.copy()
 
         # Push to hub with config hash as revision
         combined_dataset.push_to_hub(
@@ -1897,7 +2001,7 @@ This is a cached dataset produced by https://github.com/allenai/open-instruct
             repo_name, split=DEFAULT_SPLIT_FOR_CACHED_DATASET, revision=self.config_hash, num_proc=max_num_processes()
         )
         assert isinstance(final_dataset, Dataset)
-        return final_dataset
+        return final_dataset, EMPTY_DATASET_STATISTICS.copy()
 
 
 class LocalDatasetTransformationCache:
@@ -1945,7 +2049,7 @@ class LocalDatasetTransformationCache:
                 return dataset, statistics
             else:
                 # Return empty statistics if not cached
-                return dataset, {"per_dataset_stats": [], "dataset_order": []}
+                return dataset, EMPTY_DATASET_STATISTICS.copy()
 
         print("Cache not found or invalid, transforming datasets...")
 
@@ -2031,6 +2135,7 @@ def load_dataset_configs(
     transform_fn_args: list[dict[str, Any]],
     target_columns: list[str] | None = None,
     dataset_config_seed: int = 42,
+    dataset_mixer_list_config_names: list[str | None] | None = None,
 ) -> list[DatasetConfig]:
     """
     Load and configure datasets from a mixer list.
@@ -2050,6 +2155,8 @@ def load_dataset_configs(
 
         dataset_mixer_list_splits: Split names for each dataset (e.g., ["train"]).
             If a single split is provided, it's used for all datasets.
+        dataset_mixer_list_config_names: Optional Hugging Face dataset config names for
+            each dataset. If a single config is provided, it's used for all datasets.
         dataset_transform_fn: Transform function names to apply.
         transform_fn_args: Arguments for transform functions.
         target_columns: Optional list of columns to keep.
@@ -2068,6 +2175,21 @@ def load_dataset_configs(
                 f"dataset_mixer_list_splits length must be half of dataset_mixer_list (since mixer list alternates [dataset, amount]): {len(dataset_mixer_list_splits)=} != {len(dataset_mixer_list)//2=}"
             )
     assert len(dataset_mixer_list) % 2 == 0, f"Data mixer list length is not even: {dataset_mixer_list}"
+    num_datasets = len(dataset_mixer_list) // 2
+    if dataset_mixer_list_config_names is None or len(dataset_mixer_list_config_names) == 0:
+        dataset_mixer_list_config_names = [None] * num_datasets
+    elif len(dataset_mixer_list_config_names) == 1:
+        dataset_mixer_list_config_names = dataset_mixer_list_config_names * num_datasets
+    elif len(dataset_mixer_list_config_names) != num_datasets:
+        raise ValueError(
+            f"dataset_mixer_list_config_names length must be half of dataset_mixer_list "
+            f"(since mixer list alternates [dataset, amount]): {len(dataset_mixer_list_config_names)=} "
+            f"!= {num_datasets=}"
+        )
+    dataset_mixer_list_config_names = [
+        None if config_name in (None, "", "none", "None", "null", "Null") else config_name
+        for config_name in dataset_mixer_list_config_names
+    ]
     for i in range(0, len(dataset_mixer_list), 2):
         dataset_name = dataset_mixer_list[i]
         frac_or_num_samples = dataset_mixer_list[i + 1]
@@ -2082,6 +2204,7 @@ def load_dataset_configs(
             dataset_name=dataset_name,
             dataset_split=dataset_mixer_list_splits[i // 2],
             dataset_revision="main",
+            dataset_config_name=dataset_mixer_list_config_names[i // 2],
             transform_fn=dataset_transform_fn,
             transform_fn_args=transform_fn_args,
             target_columns=target_columns,
@@ -2127,6 +2250,7 @@ def get_cached_dataset_tulu_with_statistics(
     drop_dataset_source: bool = True,
     dataset_config_seed: int = 42,
     system_prompt_override: str | None = None,
+    dataset_mixer_list_config_names: list[str | None] | None = None,
 ) -> tuple[Dataset, dict[str, Any]]:
     if dataset_config_hash is None:
         dcs = load_dataset_configs(
@@ -2136,6 +2260,7 @@ def get_cached_dataset_tulu_with_statistics(
             transform_fn_args,
             target_columns,
             dataset_config_seed,
+            dataset_mixer_list_config_names,
         )
         dataset_config_hash = compute_config_hash(dcs, tc)
     else:
@@ -2169,6 +2294,7 @@ def get_cached_dataset_tulu(
     dataset_skip_cache: bool = False,
     dataset_config_seed: int = 42,
     system_prompt_override: str | None = None,
+    dataset_mixer_list_config_names: list[str | None] | None = None,
 ) -> Dataset:
     return get_cached_dataset_tulu_with_statistics(
         dataset_mixer_list=dataset_mixer_list,
@@ -2185,4 +2311,5 @@ def get_cached_dataset_tulu(
         drop_dataset_source=True,
         dataset_config_seed=dataset_config_seed,
         system_prompt_override=system_prompt_override,
+        dataset_mixer_list_config_names=dataset_mixer_list_config_names,
     )[0]

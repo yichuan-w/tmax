@@ -295,6 +295,7 @@ class GRPOTrainModule(TransformerTrainModule):
         device: torch.device | None = None,
         state_dict_save_opts: dist_cp_sd.StateDictOptions | None = None,
         state_dict_load_opts: dist_cp_sd.StateDictOptions | None = None,
+        num_samples_per_prompt: int = 1,
     ):
         rank_microbatch_size_tokens = sample_microbatch_size * max_sequence_length
         super().__init__(
@@ -316,6 +317,7 @@ class GRPOTrainModule(TransformerTrainModule):
         self.temperature = temperature
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
+        self.num_samples_per_prompt = num_samples_per_prompt
 
         self.ref_policy = ref_policy
         if ref_policy is not None:
@@ -393,11 +395,15 @@ class GRPOTrainModule(TransformerTrainModule):
                         old_logprobs_BT[i] = local_old_logprobs_BT[i]
 
         if self.grpo_config.loss_denominator == "token" or self.grpo_config.loss_denominator is None:
-            accumulation_token_counts = grpo_utils.calculate_token_counts(
+            accumulation_loss_denominators = grpo_utils.calculate_token_counts(
+                accumulation_steps, data_BT, self.device, self.trainer.dp_process_group
+            )
+        elif self.grpo_config.loss_denominator == "sequence":
+            accumulation_loss_denominators = grpo_utils.calculate_sequence_counts(
                 accumulation_steps, data_BT, self.device, self.trainer.dp_process_group
             )
         else:
-            accumulation_token_counts = {
+            accumulation_loss_denominators = {
                 int(group_idx * accumulation_steps): float(self.grpo_config.loss_denominator)
                 for group_idx in range((num_samples // accumulation_steps) + 1)
             }
@@ -443,12 +449,54 @@ class GRPOTrainModule(TransformerTrainModule):
 
                 advantages = data_BT.advantages[sample_idx]
 
+                # DPPO requires `use_vllm_logprobs=True` (validated in
+                # GRPOExperimentConfig), so `old_logprob == vllm_logprobs` and the
+                # ratio is computed against the rollout policy μ_θ' (Takeaway 2
+                # in arXiv:2602.04879) without a special-case branch here.
                 log_ratio = new_logprobs - old_logprob
                 ratio = torch.exp(log_ratio)
 
                 tis_clamped, tis_unclamped = grpo_utils.compute_tis_weights(
                     old_logprob, vllm_logprobs, response_mask, self.grpo_config.truncated_importance_sampling_ratio_cap
                 )
+                tis_mask = grpo_utils.compute_tis_mask(
+                    new_logprobs,
+                    vllm_logprobs,
+                    response_mask,
+                    self.grpo_config.tis_mask_lower,
+                    self.grpo_config.tis_mask_upper,
+                )
+                if self.grpo_config.loss_fn == grpo_utils.GRPOLossType.dppo:
+                    dppo_mask, _ = grpo_utils.compute_dppo_mask(
+                        new_logprobs=new_logprobs,
+                        behavior_logprobs=vllm_logprobs,
+                        advantages=advantages[:, 1:],
+                        ratio=ratio,
+                        response_mask=response_mask,
+                        divergence_type=self.grpo_config.dppo_divergence_type,
+                        divergence_threshold=self.grpo_config.dppo_divergence_threshold,
+                    )
+                else:
+                    dppo_mask = None
+                if self.grpo_config.loss_fn == grpo_utils.GRPOLossType.tvpo:
+                    rollout_ids = (
+                        data_BT.rollout_sample_ids[sample_idx][:, 1:]
+                        if data_BT.rollout_sample_ids is not None
+                        else None
+                    )
+                    tvpo_mask, _ = grpo_utils.compute_tvpo_mask(
+                        new_logprobs=new_logprobs,
+                        behavior_logprobs=vllm_logprobs,
+                        advantages=advantages[:, 1:],
+                        ratio=ratio,
+                        response_mask=response_mask,
+                        divergence_threshold=self.grpo_config.tvpo_divergence_threshold,
+                        rollout_ids=rollout_ids,
+                        num_samples_per_prompt=self.num_samples_per_prompt,
+                    )
+                else:
+                    tvpo_mask = None
+                combined_tis = grpo_utils.combine_tis_terms(tis_clamped, tis_mask, dppo_mask)
 
                 pg_losses, pg_losses2, pg_loss, kl = grpo_utils.compute_grpo_loss(
                     new_logprobs=new_logprobs,
@@ -456,12 +504,24 @@ class GRPOTrainModule(TransformerTrainModule):
                     advantages=advantages[:, 1:],
                     ref_logprobs=ref_logprobs_BT[sample_idx] if ref_logprobs_BT is not None else None,
                     config=self.grpo_config,
-                    tis_weights=tis_clamped,
+                    tis_weights=combined_tis,
+                    policy_freeze_mask=tvpo_mask,
                 )
 
                 batch_start = (sample_idx // accumulation_steps) * accumulation_steps
-                loss_denominator = accumulation_token_counts[batch_start]
-                loss = masked_mean(pg_loss + self.grpo_config.beta * kl, response_mask, None, loss_denominator)
+                loss_denominator = accumulation_loss_denominators[batch_start]
+                per_token_loss = pg_loss + self.grpo_config.beta * kl
+                if self.grpo_config.loss_denominator == "sequence":
+                    rollout_ids = (
+                        data_BT.rollout_sample_ids[sample_idx][:, 1:]
+                        if data_BT.rollout_sample_ids is not None
+                        else None
+                    )
+                    loss = grpo_utils.sequence_weighted_mean(
+                        per_token_loss, response_mask, loss_denominator, rollout_ids
+                    )
+                else:
+                    loss = masked_mean(per_token_loss, response_mask, None, loss_denominator)
 
                 loss = loss * dp_world_size
                 loss.backward()

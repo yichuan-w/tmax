@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # Training script for GRPO with SWERL Sandbox environment (4 nodes x 8 GPUs on Beaker)
 #
 # SWERL Sandbox: Per-sample Docker tasks with bash-only tool loop (TassieAgent style).
@@ -22,6 +23,8 @@ uv run python mason.py \
        --num_nodes 4 \
        --max_retries 0 \
        --env REPO_PATH=/stage \
+       --env BEAKER_ALLOW_SUBCONTAINERS=1 \
+       --env BEAKER_SKIP_DOCKER_SOCKET=1 \
        --env VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
        --env VLLM_DISABLE_COMPILE_CACHE=1 \
        --env VLLM_USE_V1=1 \
@@ -73,7 +76,7 @@ uv run python mason.py \
     --advantage_normalization_type centered \
     --truncated_importance_sampling_ratio_cap 2.0 \
     --no_resampling_pass_rate 0.875 \
-    --rollouts_save_path /output/rollouts \
+    --rollouts_save_path /weka/oe-adapt-default/allennlp/deletable_rollouts/ \
     --output_dir /output \
     --exp_name swerl_sandbox_qwen3_4b_4node_tmax_10k_grpo \
     --local_eval_every 10 \
