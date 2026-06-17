@@ -68,7 +68,8 @@ kinds, and SFT warm-start details.
 ### Train a model
 
 SFT and DPPO RL are run via the open-instruct fork in `training/open-instruct/`.
-Launch scripts for the tmax models live under `scripts/tmax/` (`SFT/` and `RL/`):
+Launch scripts for the tmax models live under `training/open-instruct/scripts/tmax/`
+(`SFT/` and `RL/`):
 
 ```bash
 # from training/open-instruct/, e.g. RL on Qwen3.5-4B
