@@ -28,9 +28,9 @@ uv run python open_instruct/grpo_fast.py \
     --dataset_mixer_list hamishivi/agent-task-openthoughts 1.0 \
     --dataset_mixer_list_splits train \
     --max_prompt_token_length 2048 \
-    --per_turn_max_tokens 8192 \
-    --response_length 16384 \
-    --pack_length 19000 \
+    --per_turn_max_tokens 4096 \
+    --response_length 8192 \
+    --pack_length 10240 \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout 1 \
     --num_samples_per_prompt_rollout 8 \
@@ -38,7 +38,7 @@ uv run python open_instruct/grpo_fast.py \
     --model_name_or_path hamishivi/Qwen3.5-2B \
     --temperature 1.0 \
     --learning_rate 1e-6 \
-    --total_episodes 128000 \
+    --total_episodes 32 \
     --lr_scheduler_type constant \
     --deepspeed_stage 3 \
     --num_epochs 1 \
@@ -58,7 +58,7 @@ uv run python open_instruct/grpo_fast.py \
     --push_to_hub false \
     --with_tracking \
     --save_traces \
-    --save_trainer_logprobs true \
+    --save_trainer_logprobs false \
     --tools swerl_vanillux_sandbox \
     --tool_configs '{"task_data_hf_repo": "hamishivi/agent-task-openthoughts", "test_timeout": 120, "image": "python:3.12-slim"}' \
     --pool_size 16 \
