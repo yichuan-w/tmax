@@ -3,6 +3,7 @@
 These are the training launch scripts for the tmax fork (Qwen 3.5 + terminal agent training).
 
 I recommend starting with the 1 GPU RL debug script (`qwen35_2b_1gpu.sh`), and then scaling up to the full-size scripts.
+The debug script should run, take 3 steps, and exit without errors if everything is working.
 
 **Important**: For people at ai2, you should run in beaker session with `BEAKER_ALLOW_SUBCONTAINERS=1` and `BEAKER_SKIP_DOCKER_SOCKET=1` set to avoid using beaker's own docker instance, which is not allowed. For podman to work, you should also use an image with ubuntu 24.04 or newer (e.g., one interactive session command that works is `beaker session create --gpus 1 --remote --bare --cluster ai2/saturn --image beaker://hamishivi/hamishivi-interactive --host-networking --mount src=weka,ref=oe-adapt-default,subpath=hamishi,dst=/root --mount src=weka,ref=oe-training-default,dst=/weka/oe-training-default --mount src=weka,ref=oe-adapt-default,dst=/weka/oe-adapt-default   --workspace ai2/olmo-instruct --workdir /root  --priority urgent --env BEAKER_ALLOW_SUBCONTAINERS=1 --env BEAKER_SKIP_DOCKER_SOCKET=1 -- bash`). You also might need to run `unset LD_LIBRARY_PATH` to avoid conflicts with the system libraries when running stuff in interactives.
 
