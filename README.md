@@ -9,7 +9,8 @@
 <p align="center">
   💻 <a href="https://github.com/hamishivi/tmax">Code</a> ·
   🤗 <a href="https://huggingface.co/collections/allenai/tmax">Models &amp; Data</a> ·
-  📜 <a href="#">Paper</a> <!-- TODO: add paper link -->
+  📜 <a href="#">Paper</a> ·
+  📓 <a href="https://wai-org.com/blog/tmax/">Blog</a>
 </p>
 
 ---
