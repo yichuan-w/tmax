@@ -3407,8 +3407,6 @@ def main(
 
 
 if __name__ == "__main__":
-    utils.check_oe_eval_internal()
-
     parser = ArgumentParserPlus(
         (
             grpo_utils.GRPOExperimentConfig,
