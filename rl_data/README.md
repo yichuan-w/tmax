@@ -163,6 +163,37 @@ The same pipeline produces the SFT warm-start set: generate ~2.2k environments,
 then run `generate_solutions` to roll out 8 trajectories per environment. The
 successful (pass) trajectories form the SFT corpus used to warm-start RL.
 
+## Evaluating on the published Harbor dataset
+
+The full 15k corpus is published on the [Harbor](https://www.harborframework.com/docs/datasets)
+registry as **`tmax/TMax-15K-Harbor`** (public). Each task ships as a
+self-contained Harbor environment with a programmatic verifier, so you can
+evaluate any agent/model on it without regenerating anything.
+
+Evaluate an agent on the dataset with `harbor run -d` ([run docs](https://www.harborframework.com/docs/datasets)):
+
+```bash
+# full dataset
+uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+    --agent terminus-2 --model "<model>" --env docker
+
+# a quick subset: cap the number of tasks (-l) and/or filter by name (-i / -x)
+uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+    --agent terminus-2 --model "<model>" --env docker \
+    -i "task_00000*" -l 10
+```
+
+Results (per-task reward, agent/verifier logs) are written under `jobs/<job-name>/`.
+
+**No local Docker?** Use the Daytona cloud sandbox instead of building images
+locally — set `DAYTONA_API_KEY` and pass `--env daytona`:
+
+```bash
+uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+    --agent terminus-2 --model "<model>" \
+    --env daytona --n-concurrent 10
+```
+
 ## Requirements
 
 - `uv` for dependency management (deps pinned in the repo-root `pyproject.toml` / `uv.lock`).
@@ -171,3 +202,7 @@ successful (pass) trajectories form the SFT corpus used to warm-start RL.
   endpoints are supported via env vars — see `scripts/README.md`.
 - `apptainer` on PATH for building/running task containers.
 - `HF_TOKEN` for the upload stage.
+- To evaluate on the published `tmax/TMax-15K-Harbor` dataset: the `harbor` CLI
+  (a project dep, run via `uv run harbor …`), a model API key for your chosen
+  agent, and a container runtime — Docker locally, or `DAYTONA_API_KEY` for the
+  Daytona sandbox on Docker-less hosts.

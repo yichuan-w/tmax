@@ -34,6 +34,11 @@ dummy.o
 sft/.deepspeed_env
 nemotron-terminal.pdf
 
+## secrets / local env
+.env
+.harbor.env
+*.harbor.env
+
 ## personal stuff
 hamish*
 jobs/*

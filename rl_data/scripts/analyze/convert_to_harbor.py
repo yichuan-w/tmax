@@ -170,9 +170,13 @@ def generate_dockerfile(
 
     # 2. Fixtures from the %files section, staged under _fixtures/ in the build
     #    context. Copied before the task %post so the post step can reference them.
+    #    NOTE: use the shell (whitespace-delimited) COPY form, NOT the JSON/exec
+    #    array form. Daytona's Dockerfile build-context parser does not handle the
+    #    array form and mis-reads the source path (trailing comma), which breaks
+    #    the build. Our fixture paths contain no spaces, so shell form is safe.
     if fixture_copies:
         for ctx_path, dest in fixture_copies:
-            lines.append(f'COPY ["{ctx_path}", "{dest}"]')
+            lines.append(f"COPY {ctx_path} {dest}")
         lines.append("")
 
     # 3. Task-specific %post.
