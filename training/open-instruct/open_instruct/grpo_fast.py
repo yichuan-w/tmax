@@ -647,7 +647,10 @@ class PolicyTrainerRayProcess(RayProcess):
                     for engine in vllm_engines
                 ]
             else:
-                master_address = self.get_current_node_ip()
+                # On single-node hosts whose primary IP is IPv6, the stateless PG socket
+                # (AF_INET) can't bind it -> "Address family for hostname not supported".
+                # Allow overriding the rendezvous address (e.g. 127.0.0.1) via env.
+                master_address = os.environ.get("OPEN_INSTRUCT_MASTER_ADDR") or self.get_current_node_ip()
                 master_port = utils.find_free_port()
                 vllm_num_engines, vllm_tensor_parallel_size = (
                     self.vllm_config.vllm_num_engines,

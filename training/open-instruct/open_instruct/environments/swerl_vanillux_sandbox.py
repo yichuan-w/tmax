@@ -391,7 +391,16 @@ class SWERLVanilluxSandboxEnv(RLEnvironment):
                 for fname in files:
                     src_path = os.path.join(root, fname)
                     rel_file = os.path.join(rel_root, fname) if rel_root != "." else fname
-                    tar.add(src_path, arcname=f"{prefix}/{rel_file}")
+                    # Zero the owner so rootless podman can lchown extracted files to root
+                    # (host uid like 741054 is not a valid subuid inside the container userns).
+                    def _root_owner(ti):
+                        ti.uid = 0
+                        ti.gid = 0
+                        ti.uname = ""
+                        ti.gname = ""
+                        return ti
+
+                    tar.add(src_path, arcname=f"{prefix}/{rel_file}", filter=_root_owner)
 
         self._backend.put_archive("/", tar_stream.getvalue())
 

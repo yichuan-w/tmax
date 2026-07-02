@@ -231,6 +231,12 @@ class DockerBackend(SandboxBackend):
                 phase_timings["image_pull"] = time.perf_counter() - phase_start_time
 
             phase_start_time = time.perf_counter()
+            # Optional network mode override (e.g. "host" or "none"). On rootless-podman
+            # hosts where netavark cannot load ip_tables, "host" avoids bridge setup.
+            _create_kwargs = {}
+            _net_mode = os.environ.get("SWERL_DOCKER_NETWORK_MODE")
+            if _net_mode:
+                _create_kwargs["network_mode"] = _net_mode
             self._container = self._client.containers.create(
                 self._image,
                 command="sleep infinity",
@@ -239,6 +245,7 @@ class DockerBackend(SandboxBackend):
                 labels={"open_instruct": "swerl_sandbox"},
                 mem_limit=self._mem_limit,
                 memswap_limit=self._mem_limit,
+                **_create_kwargs,
             )
             phase_timings["container_create"] = time.perf_counter() - phase_start_time
 
