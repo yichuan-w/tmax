@@ -84,4 +84,59 @@ pull-only images would make it runnable.
 
 ---
 
+# TMAX-27B — the RL gain shrinks at scale (Qwen3.6-27B + DPPO)
+
+Same methodology, benchmarks, agent, and serve recipe as the 9B suite above, applied to
+**[allenai/tmax-27b](https://huggingface.co/allenai/tmax-27b)** vs its base **Qwen3.6-27B**
+(base served on `:8011`, RL on `:8012`; TP=2, CUDA-graphs on, GDN triton backend).
+
+## Headline: at 27B, RL barely moves the needle — and the paper agrees
+
+`avg@k` = mean pass/fail reward over all `k` attempts of every task (errored trials = 0), as before.
+The **Δ RL (paper)** column is from the paper's own **Table 3** (Qwen3.6-27B → TMAX-27B), the only
+place the paper reports 27B numbers (TB-Lite and TB-2.1 only).
+
+| Benchmark | base (Qwen3.6-27B) | **tmax-27b (RL)** | **Δ RL (ours)** | **Δ RL (paper)** | Coverage |
+|---|---:|---:|---:|---:|---|
+| **Terminal-Bench Lite** | 63.0% | **63.9%** | **+0.8** | **−2.2** | 100 × 5 = 500 |
+| **Terminal-Bench 2.0** | 33.5% | **34.4%** | **+0.9** | *(not reported)* | 89 × 5 = 445 |
+| **Terminal-Bench 2.1** | *running* | *running* | *pending* | **+4.4** | 89 × 3 = 267 |
+| **Terminal-Bench Pro** | *running* | *running* | *pending* | *(not reported)* | 200 × 3 = 600 |
+
+**The central 9B story does not carry to 27B.** Where RL bought +2.9 to +13.1 points at 9B, at 27B it
+buys **~+0.8 to +0.9** on the two finished benchmarks — within noise. This is not a reproduction
+failure: it is exactly what the paper reports. The paper's Table 3 shows RL going **−2.2 on TB-Lite**
+(RL *hurts* the easy set) and only **+4.4 on TB-2.1**, and the authors state it plainly:
+
+> *"we improve over the Qwen 3.5 baseline, although the gap grows smaller as model size reduces … the gap
+> is biggest for TMAX-9B. As for TMAX-27B, we believe that its base (Qwen 3.6 27B) has undergone additional
+> training relative to the Qwen 3.5 series, making it much harder to improve."* (§4.2; 27B is also trained
+> only to 300 steps vs the 9B's full run.)
+
+So both the paper and this reproduction land on the same qualitative conclusion: **the TMAX recipe's
+headline RL gain is a small-model phenomenon** — Qwen3.6-27B is already strong enough that DPPO on
+TMAX-15K adds little, and on the easiest set can slightly regress.
+
+## Paper's 27B numbers (Table 3), for reference
+
+| Model | TB-Lite | TB-2.1 |
+|---|---:|---:|
+| Qwen 3.6 27B | 70.8±2.1 | 40.5±2.4 |
+| TMAX-27B | 68.6±4.7 | 44.9±1.8 |
+
+## Ours vs paper: compare the *gain*, not the absolute
+
+Our absolute 27B numbers run **below** the paper's (e.g. TB-Lite base 63.0% vs the paper's 70.8%) for the
+**same eval-infrastructure reasons documented in the 9B section**: Daytona transient errors counted as 0
+(~11–14% of trials errored here), `max-model-len 40960` vs 65536, and a different serving stack (training-venv
+vLLM + text-only multimodal workaround). Those depress the absolute level roughly uniformly for both models,
+so the **RL delta** is the trustworthy signal — and our delta (~+0.8 on TB-Lite) is consistent with the
+paper's near-zero/negative TB-Lite delta. TB-2.1 is the decisive test of the paper's one clearly-positive
+27B claim (+4.4); it is running now and will be filled in when the queue completes.
+
+*27B run: TB-2.0 (445/445) and TB-Lite (≈489/500) complete; TB-2.1 (k3) and TB-Pro (k3) queued/running via
+`run_27b_otherbench.sh`.*
+
+---
+
 *Reproduction environment: 8×H100. Data: `allenai/tmax-15k-open-instruct`. Full fixes & serve scripts in this repo.*

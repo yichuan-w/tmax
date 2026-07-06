@@ -43,3 +43,7 @@ nemotron-terminal.pdf
 hamish*
 jobs/*
 .claude/*
+
+## external benchmark task sets (pulled from Harbor registry at eval time; large, not our IP)
+terminal-bench-2-1/
+terminal-bench-pro/
