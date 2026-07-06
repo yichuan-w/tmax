@@ -98,15 +98,15 @@ place the paper reports 27B numbers (TB-Lite and TB-2.1 only).
 
 | Benchmark | base (Qwen3.6-27B) | **tmax-27b (RL)** | **Δ RL (ours)** | **Δ RL (paper)** | Coverage |
 |---|---:|---:|---:|---:|---|
-| **Terminal-Bench Lite** | 63.0% | **63.9%** | **+0.8** | **−2.2** | 100 × 5 = 500 |
+| **Terminal-Bench Lite** | 63.0% | **63.7%** | **+0.6** | **−2.2** | 100 × 5 = 500 |
 | **Terminal-Bench 2.0** | 33.5% | **34.4%** | **+0.9** | *(not reported)* | 89 × 5 = 445 |
-| **Terminal-Bench 2.1** | *running* | *running* | *pending* | **+4.4** | 89 × 3 = 267 |
-| **Terminal-Bench Pro** | *running* | *running* | *pending* | *(not reported)* | 200 × 3 = 600 |
+| **Terminal-Bench 2.1** | 34.8% | **35.2%** | **+0.4** | **+4.4** | 89 × 3 = 267 |
+| **Terminal-Bench Pro** | 47.7% | **48.0%** | **+0.3** | *(not reported)* | 200 × 3 = 600 |
 
 **The central 9B story does not carry to 27B.** Where RL bought +2.9 to +13.1 points at 9B, at 27B it
-buys **~+0.8 to +0.9** on the two finished benchmarks — within noise. This is not a reproduction
-failure: it is exactly what the paper reports. The paper's Table 3 shows RL going **−2.2 on TB-Lite**
-(RL *hurts* the easy set) and only **+4.4 on TB-2.1**, and the authors state it plainly:
+buys just **+0.3 to +0.9 across all four benchmarks** — within noise. This is not a reproduction
+failure: it is directionally exactly what the paper reports. The paper's Table 3 shows RL going **−2.2 on
+TB-Lite** (RL *hurts* the easy set) and **+4.4 on TB-2.1**, and the authors state it plainly:
 
 > *"we improve over the Qwen 3.5 baseline, although the gap grows smaller as model size reduces … the gap
 > is biggest for TMAX-9B. As for TMAX-27B, we believe that its base (Qwen 3.6 27B) has undergone additional
@@ -128,14 +128,20 @@ TMAX-15K adds little, and on the easiest set can slightly regress.
 
 Our absolute 27B numbers run **below** the paper's (e.g. TB-Lite base 63.0% vs the paper's 70.8%) for the
 **same eval-infrastructure reasons documented in the 9B section**: Daytona transient errors counted as 0
-(~11–14% of trials errored here), `max-model-len 40960` vs 65536, and a different serving stack (training-venv
+(~5–15% of trials errored here), `max-model-len 40960` vs 65536, and a different serving stack (training-venv
 vLLM + text-only multimodal workaround). Those depress the absolute level roughly uniformly for both models,
-so the **RL delta** is the trustworthy signal — and our delta (~+0.8 on TB-Lite) is consistent with the
-paper's near-zero/negative TB-Lite delta. TB-2.1 is the decisive test of the paper's one clearly-positive
-27B claim (+4.4); it is running now and will be filled in when the queue completes.
+so the **RL delta** is the trustworthy signal.
 
-*27B run: TB-2.0 (445/445) and TB-Lite (≈489/500) complete; TB-2.1 (k3) and TB-Pro (k3) queued/running via
-`run_27b_otherbench.sh`.*
+On **TB-Lite**, our delta (+0.6) matches the paper's near-zero/negative delta (−2.2) — RL adds nothing on the
+easy set at 27B. On **TB-2.1** — the paper's one clearly-positive 27B claim (**+4.4**) — we measure only **+0.4**:
+the *direction* reproduces (RL ≥ base) but the *magnitude* does not. Note the paper's own TB-2.1 gap is ~1.5σ
+(40.5±2.4 → 44.9±1.8), so +4.4 is a fairly soft signal to begin with; combined with our shorter context window
+(40960 vs 65536, which disproportionately truncates the RL model's longer trajectories) and errored-trial noise,
+the honest read is that **at 27B the RL gain is ≤1 point everywhere we measured (+0.3 to +0.9)** — the recipe's
+headline improvement is a small-model phenomenon, consistent with the paper's own "harder to improve" caveat.
+
+*27B run complete: TB-Lite 500/500, TB-2.0 445/445, TB-2.1 267/267, TB-Pro 598–600/600, via
+`run_27b_otherbench.sh` (avg@k = harbor `metrics.mean`, errored trials = 0).*
 
 ---
 
