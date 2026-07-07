@@ -31,16 +31,31 @@ def _is_orphan(s):
         return True
     return False
 
+# Daytona-NATIVE billing backstop: enable idle auto-stop on our sandboxes so Daytona itself
+# stops (and, with auto_delete_interval=0, immediately deletes) any sandbox idle >30 min — even
+# if this daemon / the whole box dies. Idle-based, so it never touches an actively-running trial.
+AUTO_STOP_MIN = 30
+def _ensure_autostop(s):
+    try:
+        if (s.labels or {}).get("tmaxeval") == "1" and getattr(s, "auto_stop_interval", 0) in (0, None):
+            s.set_autostop_interval(AUTO_STOP_MIN)
+            return True
+    except Exception:
+        pass
+    return False
+
 while True:
     try:
         sbs = list(d.list())
         mine = [s for s in sbs if (s.labels or {}).get("tmaxeval") == "1"]
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            armed = sum(1 for r in ex.map(_ensure_autostop, mine) if r)
         victims = [s for s in sbs if _is_orphan(s)]
         with cf.ThreadPoolExecutor(max_workers=8) as ex:
             ok = sum(1 for r in ex.map(lambda s: (d.delete(s), True)[1] if True else False, victims) if r) if victims else 0
         print(f"{dt.datetime.now().strftime('%H:%M:%S')} total={len(sbs)} mine={len(mine)} "
               f"titan={sum(1 for s in sbs if (s.labels or {}).get('owner')=='titan_swe_r2e')} "
-              f"orphans_deleted={ok}", flush=True)
+              f"autostop_armed={armed} orphans_deleted={ok}", flush=True)
     except Exception as e:
         print(f"daemon err: {e!r}"[:120], flush=True)
     time.sleep(300)
