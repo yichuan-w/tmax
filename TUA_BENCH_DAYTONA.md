@@ -139,14 +139,35 @@ builds bleed into the setup window):
 uv run python eval_harbor.py run -p TUA-Bench/tasks --env daytona --yes --force-build \
   --agent-import-path Vanillux2Agent:Vanillux2Agent \
   --model openai/tmax-9b --agent-kwarg api_base=http://localhost:8016/v1 \
-  --agent-kwarg max_format_errors=64 --n-concurrent 8 -k 1 \
+  --agent-kwarg max_format_errors=64 --n-concurrent 20 -k 5 \
   --agent-setup-timeout-multiplier 7 \
   --max-retries 3 --retry-include AgentTimeoutError --retry-include DaytonaError \
+  --retry-include DaytonaNotFoundError --retry-include VerifierTimeoutError \
   --job-name tua-tmax
 ```
 
-`run_tua_dual.sh` in this repo wraps all of the above (resource caps + self-healing serves +
-tmax-9b vs base, both models via Daytona).
+`-k 5` runs each of the 120 tasks 5× (= 600 trials) for **avg@5**. Two model serves (tmax-9b on
+`:8016`, base on `:8017`) run concurrently; `run_tua_dual.sh` / `_tua_tmax.sh` / `_tua_base.sh` in
+this repo wrap all of the above (resource caps + self-healing GDN serves + both models via Daytona).
+
+> **Tail rate-limit:** running both evals at once (2 × `--n-concurrent 20`) can throttle the Daytona
+> control plane near the end (`DaytonaAuthorizationError` / `ThrottlerException` / `DaytonaRateLimitError`),
+> spiking the errored-trial count. Those are infra, not model failures — report avg@5 **excluding
+> errored trials** for a fair model comparison, or lower `--n-concurrent` / stagger the two runs.
+
+## Result (this repo's run — tmax-9b RL vs base Qwen3.5-9B, k=5)
+
+| Metric | base (Qwen3.5-9B) | **tmax-9b (RL)** | Δ RL |
+|---|---:|---:|---:|
+| completed | 597 / 600 | **600 / 600** | |
+| **avg@5 (error-excluded)** | **16.4%** | **24.9%** | **+8.5** |
+| avg@5 (raw, errored = 0) | 10.2% | 19.1% | +8.9 |
+| perfect solves (reward = 1.0) | 56 | **91** | +35 |
+| tasks solved (≥1 positive attempt) | 40 / 120 | **50 / 120** | +10 |
+
+TUA rewards are continuous (0–1 partial credit). RL wins by **+8.5 avg@5** — the recipe's
+second-largest 9B gain, as expected for its own training domain. See `RESULTS.md` for the full
+Terminal-Bench-family comparison.
 
 ## Gotchas
 

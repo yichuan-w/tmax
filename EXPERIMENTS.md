@@ -12,9 +12,10 @@ attempts (errored trials = 0), matching the paper's methodology. See `RESULTS.md
 ## 1. Headline conclusions
 
 1. **RL gain is a small-model phenomenon.** At **9B**, DPPO on TMAX-15K wins by **+2.9…+13.1**
-   across the Terminal-Bench family. At **27B** it collapses to **≤+0.9 on every benchmark** —
-   the strong Qwen3.6-27B base is already near the recipe's ceiling. This reproduces the paper's
-   own admission ("the gap is biggest for TMAX-9B … [27B] much harder to improve").
+   across the Terminal-Bench family, **plus +8.5 on TUA-Bench** (the recipe's own terminal-agent
+   training domain, k=5 avg@5). At **27B** it collapses to **≤+0.9 on every benchmark** — the
+   strong Qwen3.6-27B base is already near the recipe's ceiling. This reproduces the paper's own
+   admission ("the gap is biggest for TMAX-9B … [27B] much harder to improve").
 2. **The user's own RL run at step-100 shows no gain yet** — it tracks the **base** model on all
    four benchmarks (≈ within noise), well below the official `tmax-9b`. step-40 had actually
    dipped slightly *below* base; step-100 recovered *to* base. Interpretation: either too early
@@ -43,9 +44,16 @@ serving stack) — so the **RL delta** is the trustworthy signal. Full detail in
 | Benchmark | base (Qwen3.5-9B) | tmax-9b (RL) | **Δ** |
 |---|---:|---:|---:|
 | TB-Lite | 35.9% | 49.0% | **+13.1** |
+| TUA-Bench (k5) † | 16.4% | 24.9% | **+8.5** |
+| TB-Pro  | 33.7% | 40.0% | **+6.3** |
 | TB-2.0  | 18.4% | 23.1% | **+4.7** |
 | TB-2.1  | 19.9% | 22.8% | **+2.9** |
-| TB-Pro  | 33.7% | 40.0% | **+6.3** |
+
+† TUA-Bench avg@5 shown **error-excluded** (raw errored-as-0 = 19.1 vs 10.2, +8.9). Its error rate
+ran high (tmax 25% / base 43%) from a shared-Daytona rate-limit throttle at the tail, not model
+failures — the RL delta is robust either way. TUA rewards are continuous (partial credit); tmax
+also solved more tasks (50 vs 40 / 120) and hit 91 vs 56 perfect-solve trials. See `RESULTS.md`
+and `TUA_BENCH_DAYTONA.md`.
 
 ## 4. User's own checkpoints — step-40 & step-100  (torchtitan Qwen3.5-9B + RL)
 
@@ -107,6 +115,23 @@ only on ephemeral-delete + a local orphan daemon (both die if the box dies). Fix
 → Daytona itself stops+deletes idle orphans (with `auto_delete_interval=0` = delete-on-stop),
 bounding billing even if all local scripts die.
 
+### 5.7 TUA-Bench "slow build" was a **setup hang** → Daytona backend patch
+TUA looked un-runnable (each task seemed to "hang ~15 min", `result.json` stuck at 0/N). It is
+**not** a slow build: the sandbox builds + STARTS in seconds. Root cause — TUA task Dockerfiles end
+with `USER agent` (non-root), so the Daytona sandbox runs as `agent`, which has **no sudo** and
+cannot create/write `/tests` `/solution` `/logs`. Harbor's post-build setup writes those and runs
+some commands as root via **`su root`** → password prompt → hangs forever. (TB tasks don't set a
+non-root final `USER`, so they run setup as root and never hit this.) Fix (full recipe in
+**`TUA_BENCH_DAYTONA.md`**): (a) cap task resources to the Daytona tier (cpus≤4 / mem≤8192 /
+storage≤10240 — defaults of 6/30720 exceed it and fail sandbox startup); (b) patch
+`.venv/…/harbor/environments/daytona.py` — at build time install sudo, pre-create + chown
+`/tests //solution //logs`, grant `agent` NOPASSWD sudo, restore the final `USER`; and elevate in
+`_sandbox_exec` via **`sudo -n bash -c`** (never the hanging `su root`). Serve with `--force-build`
+so the sudo layer bakes in. Result: a task builds + sets up + runs in **~15–20 s** — TUA is fast,
+not slow. (These `.venv` patches aren't git-tracked; backup at `/dev/shm/daytona.py.bak`, reapply
+after any `uv sync`.) The tail rate-limit error spike (25%/43%) is a separate, transient effect of
+two evals hammering the Daytona control plane at once, not the setup hang.
+
 ### 5.6 Disk / quota workarounds
 `/home` sits at its per-user disk quota; eval log/job churn repeatedly tripped ENOSPC (which
 freezes command-output capture). Mitigations: serve logs → `/dev/shm`, HF weights served from
@@ -126,6 +151,9 @@ explicit PID via `nvidia-smi --query-compute-apps=pid`.
 | `run_step100_bench2.sh` | dual-serve self-healing bench suite (TB-Lite→2.1→Pro) |
 | `run_27b_otherbench.sh` | 27B self-healing bench queue |
 | `tua_daemon.py` | Daytona orphan cleaner + native auto-stop arming |
+| `run_tua_dual.sh` / `_tua_tmax.sh` / `_tua_base.sh` | TUA-Bench dual run (tmax-9b vs base), self-healing serves |
+| `serve_tmax9b_tua.sh` / `serve_base9b_tua.sh` | GDN serve recipes for TUA (tmax :8016 / base :8017) |
+| `TUA_BENCH_DAYTONA.md` | how to run TUA-Bench on Daytona — the setup-hang fix |
 | `eval_harbor.py` | Harbor eval wrapper |
 
 *Environment: 8×H100. Data: `allenai/tmax-15k-open-instruct`. Models: `hamishivi/Qwen3.5-9B`,
